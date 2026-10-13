@@ -21,6 +21,7 @@ namespace sim
             "                        N=silence\n"
             "                        N=sine[:FREQ_HZ[:LEVEL_DB]]\n"
             "                        N=file:PATH[:LEVEL_DB]\n"
+            "  --play              start the song transport playing (files in sync)\n"
             "  -h, --help          show this help\n"
             "\n"
             "Load the loopback card first: ./setup-loopback.sh\n";
@@ -132,6 +133,12 @@ namespace sim
 
             if (arg == "-h" || arg == "--help")
                 return { std::nullopt, kUsage, 0 };
+
+            if (arg == "--play")
+            {
+                config.startPlaying = true;
+                continue;
+            }
 
             if (i + 1 >= argc)
                 return fail("missing value for " + arg);

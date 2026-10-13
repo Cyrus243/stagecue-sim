@@ -50,13 +50,23 @@ namespace
                 writeLE<std::int16_t>(out, static_cast<std::int16_t>(std::lround(channel[i] * 32767.0f)));
         return path;
     }
+
+    std::vector<float> ramp(std::size_t length)
+    {
+        std::vector<float> samples(length);
+        for (std::size_t i = 0; i < length; ++i)
+            samples[i] = static_cast<float>(i + 1) / static_cast<float>(length);
+        return samples;
+    }
+
+    constexpr TransportFrame kStopped {};
 }
 
 TEST(SilenceSource, RendersZeros)
 {
     SilenceSource source;
     std::vector<float> buffer(64, 1.0f);
-    source.render(buffer.data(), 64);
+    source.render(buffer.data(), 64, kStopped);
     EXPECT_EQ(peakOf(buffer), 0.0f);
 }
 
@@ -64,11 +74,11 @@ TEST(SineSource, PeakMatchesRequestedLevel)
 {
     SineSource source(48000.0, 1000.0f, -12.0f);
     std::vector<float> buffer(4800);
-    source.render(buffer.data(), static_cast<int>(buffer.size()));
+    source.render(buffer.data(), static_cast<int>(buffer.size()), kStopped);
     EXPECT_NEAR(gainToDb(peakOf(buffer)), -12.0f, 0.05f);
 
     source.setLevelDb(-6.0f);
-    source.render(buffer.data(), static_cast<int>(buffer.size()));
+    source.render(buffer.data(), static_cast<int>(buffer.size()), kStopped);
     EXPECT_NEAR(gainToDb(peakOf(buffer)), -6.0f, 0.05f);
 }
 
@@ -78,27 +88,66 @@ TEST(SineSource, IsPhaseContinuousAcrossBlocks)
     SineSource whole(48000.0, 997.0f, 0.0f);
 
     std::vector<float> a(1024), b(1024);
-    chunked.render(a.data(), 300);
-    chunked.render(a.data() + 300, 724);
-    whole.render(b.data(), 1024);
+    chunked.render(a.data(), 300, kStopped);
+    chunked.render(a.data() + 300, 724, kStopped);
+    whole.render(b.data(), 1024, kStopped);
     for (std::size_t i = 0; i < a.size(); ++i)
         ASSERT_NEAR(a[i], b[i], 1e-4f) << "sample " << i;
 }
 
-TEST(FileSource, LoopsSeamlesslyAtDeviceRate)
+TEST(FileSource, PlaysAtTheSongPositionAndWrapsAtTheLoopLength)
 {
-    std::vector<float> ramp(1000);
-    for (std::size_t i = 0; i < ramp.size(); ++i)
-        ramp[i] = static_cast<float>(i) / 1000.0f;
-
-    auto source = FileSource::fromSamples(ramp, 48000.0, 48000.0, 0.0f);
+    const auto samples = ramp(1000);
+    auto source = FileSource::fromSamples(samples, 48000.0, 48000.0, 0.0f);
     ASSERT_EQ(source->getLengthFrames(), 1000u);
 
-    std::vector<float> out(2500);
-    source->render(out.data(), 2500);
-    EXPECT_FLOAT_EQ(out[999], ramp[999]);
-    EXPECT_FLOAT_EQ(out[1000], ramp[0]);
-    EXPECT_FLOAT_EQ(out[2499], ramp[499]);
+    // A block straddling the loop point wraps back to the start.
+    std::vector<float> out(200);
+    source->render(out.data(), 200, { true, 900, 1000 });
+    EXPECT_FLOAT_EQ(out[0], samples[900]);
+    EXPECT_FLOAT_EQ(out[99], samples[999]);
+    EXPECT_FLOAT_EQ(out[100], samples[0]);
+    EXPECT_FLOAT_EQ(out[199], samples[99]);
+}
+
+TEST(FileSource, IsSilentWhileStoppedButSineKeepsRunning)
+{
+    auto file = FileSource::fromSamples(std::vector<float>(1000, 0.5f), 48000.0, 48000.0, 0.0f);
+    SineSource sine(48000.0, 1000.0f, -12.0f);
+
+    std::vector<float> out(480);
+    file->render(out.data(), 480, { false, 100, 1000 });
+    EXPECT_EQ(peakOf(out), 0.0f);
+
+    sine.render(out.data(), 480, { false, 100, 1000 });
+    EXPECT_GT(peakOf(out), 0.0f);
+}
+
+TEST(FileSource, FilesOfDifferentLengthsStayAlignedToOneSong)
+{
+    const auto longSamples = ramp(1000);
+    const std::vector<float> shortSamples(longSamples.begin(), longSamples.begin() + 400);
+    auto longFile = FileSource::fromSamples(longSamples, 48000.0, 48000.0, 0.0f);
+    auto shortFile = FileSource::fromSamples(shortSamples, 48000.0, 48000.0, 0.0f);
+
+    // The song loops at the longest file; render it in periods like the engine does.
+    constexpr int period = 128;
+    constexpr std::uint64_t loopLength = 1000;
+    std::vector<float> a(period), b(period);
+    for (std::uint64_t position = 0; position < 3 * loopLength; position += period)
+    {
+        const TransportFrame transport { true, position % loopLength, loopLength };
+        longFile->render(a.data(), period, transport);
+        shortFile->render(b.data(), period, transport);
+
+        for (int i = 0; i < period; ++i)
+        {
+            const auto songFrame = (position + static_cast<std::uint64_t>(i)) % loopLength;
+            ASSERT_FLOAT_EQ(a[i], longSamples[songFrame]) << "frame " << position + i;
+            ASSERT_FLOAT_EQ(b[i], songFrame < shortSamples.size() ? shortSamples[songFrame] : 0.0f)
+                << "frame " << position + i;
+        }
+    }
 }
 
 TEST(FileSource, ResamplesToDeviceRate)
@@ -126,7 +175,7 @@ TEST(FileSource, LoadsWavMixesToMonoAndAppliesLevel)
     EXPECT_NE(source->describe().find("soundcard-sim-test.wav"), std::string::npos);
 
     std::vector<float> out(4800);
-    source->render(out.data(), static_cast<int>(out.size()));
+    source->render(out.data(), static_cast<int>(out.size()), { true, 0, source->getLengthFrames() });
     EXPECT_NEAR(gainToDb(peakOf(out)), gainToDb(0.5f) - 6.0f, 0.2f);
 
     std::filesystem::remove(path);

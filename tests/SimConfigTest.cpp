@@ -37,6 +37,16 @@ TEST(SimConfig, ParsesIoCountsAndDevices)
     EXPECT_EQ(result.config->monitorDevice, "pipewire");
 }
 
+TEST(SimConfig, TransportStartsStoppedUnlessPlayIsGiven)
+{
+    EXPECT_FALSE(parse({}).config->startPlaying);
+
+    const auto result = parse({ "--play", "--inputs", "2" });
+    ASSERT_TRUE(result.config);
+    EXPECT_TRUE(result.config->startPlaying);
+    EXPECT_EQ(result.config->numInputs, 2);
+}
+
 TEST(SimConfig, RejectsOutOfRangeChannelCounts)
 {
     EXPECT_FALSE(parse({ "--inputs", "0" }).config);

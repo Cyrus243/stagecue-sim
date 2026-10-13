@@ -44,6 +44,8 @@ int main(int argc, char** argv)
         }
     }
 
+    engine.setPlaying(parsed.config->startPlaying);
+
     // A failed start is shown in the UI header; the user can fix it and press Apply.
     (void) engine.start();
 

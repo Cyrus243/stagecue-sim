@@ -185,6 +185,10 @@ namespace sim
         auto inputPointers = pointersTo(inputBuffers);
         auto outputPointers = pointersTo(outputBuffers);
         std::vector<float> stereo(static_cast<std::size_t>(numFrames) * 2);
+        std::vector<std::shared_ptr<ISource>> currentSources(static_cast<std::size_t>(numIn));
+
+        std::uint64_t position = songPosition.load();
+        std::uint64_t seenRestarts = restartRequests.load();
 
         for (unsigned i = 0; i < kPrefillPeriods; ++i)
             if (loopbackOut.writeSilence(static_cast<int>(loopbackOut.getPeriodFrames())) < 0)
@@ -217,16 +221,38 @@ namespace sim
             if (monitor.isOpen() && !monitorRing->push(stereo.data(), stereo.size()))
                 ++monitorDropouts;
 
-            // Sources -> app inputs.
+            // Sources -> app inputs, all rendered from the same song position.
+            std::uint64_t loopLength = 0;
+            for (int ch = 0; ch < numIn; ++ch)
+            {
+                auto& source = currentSources[static_cast<std::size_t>(ch)];
+                source = sources[ch].load();
+                if (source)
+                    loopLength = std::max<std::uint64_t>(loopLength, source->getLengthFrames());
+            }
+
+            if (const auto restarts = restartRequests.load(); restarts != seenRestarts)
+            {
+                seenRestarts = restarts;
+                position = 0;
+            }
+            position = loopLength > 0 ? position % loopLength : 0;
+
+            const TransportFrame transport { transportPlaying.load(), position, loopLength };
             for (int ch = 0; ch < numIn; ++ch)
             {
                 float* data = inputPointers[static_cast<std::size_t>(ch)];
-                if (const auto source = sources[ch].load())
-                    source->render(data, numFrames);
+                if (const auto& source = currentSources[static_cast<std::size_t>(ch)])
+                    source->render(data, numFrames, transport);
                 else
                     std::fill_n(data, numFrames, 0.0f);
                 inputMeters[ch].push(peakOf(data, numFrames));
             }
+
+            if (transport.playing && loopLength > 0)
+                position = (position + static_cast<std::uint64_t>(numFrames)) % loopLength;
+            songPosition = position;
+            songLength = loopLength;
 
             if (const int written = loopbackOut.write(inputPointers.data(), numFrames); written < 0)
             {

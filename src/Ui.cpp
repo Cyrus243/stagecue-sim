@@ -118,8 +118,11 @@ namespace sim
                 auto applyButton = Button("Apply / restart", [this] { applyIoConfig(); }, primaryButton());
                 auto muteCheckbox = Checkbox("mute main out", &monitorMuted, checkboxOption());
                 auto quitButton = Button("Quit", screen.ExitLoopClosure(), secondaryButton());
+                auto playButton = Button(&playLabel, [this] { togglePlaying(); }, primaryButton());
+                auto restartButton = Button("⏮ Restart", [this] { restartSong(); }, secondaryButton());
 
                 auto controls = Container::Vertical({
+                    Container::Horizontal({ playButton, restartButton }),
                     inputsSlider, outputsSlider, muteCheckbox,
                     Container::Horizontal({ applyButton, quitButton }),
                 });
@@ -132,6 +135,8 @@ namespace sim
                         });
                     };
                     return panel("Control", vbox({
+                        hbox({ playButton->Render(), text("  "), restartButton->Render() }),
+                        hbox({ muted("Song     "), text(songTime()) | bold | color(kBright) }),
                         countRow("Inputs", inputsSlider, requestedInputs),
                         countRow("Outputs", outputsSlider, requestedOutputs),
                         muteCheckbox->Render(),
@@ -348,6 +353,33 @@ namespace sim
                     log.add(Severity::Error, error);
             }
 
+            // -------------------------------------------------------- transport
+
+            void togglePlaying()
+            {
+                engine.setPlaying(!engine.isPlaying());
+                log.add(Severity::Info, engine.isPlaying() ? "Transport playing" : "Transport stopped");
+            }
+
+            void restartSong()
+            {
+                engine.restart();
+                log.add(Severity::Info, "Song restarted from 0:00");
+            }
+
+            /** "m:ss.s / m:ss.s" - song position over the loop length (the longest file). */
+            std::string songTime() const
+            {
+                const double rate = engine.getConfig().sampleRate;
+                auto format = [rate](std::uint64_t frames) {
+                    const auto tenths = static_cast<std::uint64_t>(static_cast<double>(frames) / rate * 10.0);
+                    const auto seconds = tenths / 10 % 60;
+                    return std::to_string(tenths / 600) + ":" + (seconds < 10 ? "0" : "") + std::to_string(seconds)
+                           + "." + std::to_string(tenths % 10);
+                };
+                return format(engine.getSongPositionFrames()) + " / " + format(engine.getSongLengthFrames());
+            }
+
             /** Pushes UI edits to the engine and pulls meters out of it. Runs every frame. */
             void syncWithEngine()
             {
@@ -356,6 +388,7 @@ namespace sim
                 lastSync = now;
 
                 engine.setMonitorMuted(monitorMuted);
+                playLabel = engine.isPlaying() ? "■ Stop" : "▶ Play";
 
                 for (int i = 0; i < engine.getNumInputs(); ++i)
                 {
@@ -665,6 +698,7 @@ namespace sim
             int requestedInputs;
             int requestedOutputs;
             bool monitorMuted = false;
+            std::string playLabel = "▶ Play";
             int liveOutputs = 0;
             int meterCells = kMeterCells;
 

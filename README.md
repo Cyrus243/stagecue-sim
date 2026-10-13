@@ -5,8 +5,9 @@ soundcard with a configurable number of inputs and outputs, so the
 frontend → backend → audio path can be tested without real hardware.
 
 - **Inputs** (sim → PluginHost): each one plays silence, a sine tone
-  (frequency and level), or a looped audio file (WAV/AIFF/FLAC, mixed to mono
-  and resampled to the device rate).
+  (frequency and level), or an audio file (WAV/AIFF/FLAC, mixed to mono
+  and resampled to the device rate). All files follow one shared transport, so
+  they play in sync like a live band (see [Transport](#transport)).
 - **Outputs** (PluginHost → sim): each one has a live meter, a
   **● SIGNAL** indicator (above −60 dBFS, held for 1 s) and "last signal"
   time. Outputs ticked "main out" are mixed to the computer's speakers
@@ -89,6 +90,17 @@ StageCueSoundcardSim --inputs 4 --outputs 2 \
 | `--card ID` | StageCueSim | must match `CARD_ID` used by the setup script |
 | `--monitor PCM` | default | ALSA device for the main out |
 | `--source SPEC` | | `N=silence`, `N=sine[:HZ[:DB]]`, `N=file:PATH[:DB]` |
+| `--play` | off | start the song transport playing |
+
+### Transport
+
+File inputs play like a live band: they share one song position, so they
+start together and stay sample-aligned. The song loops when the longest file
+ends, and shorter files are silent until then. **▶ Play / ■ Stop** in the
+Control panel starts and pauses the song. **⏮ Restart** rewinds it to 0:00.
+A file loaded during playback joins at the current song position. The
+transport starts stopped, so you can load every stem and then press Play
+(or pass `--play`). Sine sources ignore the transport.
 
 Keys: Tab / arrows move between controls, ←/→ adjust sliders and toggles, Enter
 loads a file path, Esc or Ctrl+C quits.

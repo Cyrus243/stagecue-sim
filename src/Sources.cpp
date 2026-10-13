@@ -63,7 +63,7 @@ namespace sim
 
     // ---------------------------------------------------------------- silence
 
-    void SilenceSource::render(float* out, int numFrames) noexcept
+    void SilenceSource::render(float* out, int numFrames, const TransportFrame&) noexcept
     {
         std::fill_n(out, numFrames, 0.0f);
     }
@@ -75,7 +75,7 @@ namespace sim
     {
     }
 
-    void SineSource::render(float* out, int numFrames) noexcept
+    void SineSource::render(float* out, int numFrames, const TransportFrame&) noexcept
     {
         const double increment = 2.0 * std::numbers::pi * frequency.load() / sampleRate;
         const float gain = dbToGain(levelDb.load());
@@ -145,13 +145,20 @@ namespace sim
         return std::shared_ptr<FileSource>(new FileSource(std::move(mono), levelDb, std::move(name)));
     }
 
-    void FileSource::render(float* out, int numFrames) noexcept
+    void FileSource::render(float* out, int numFrames, const TransportFrame& transport) noexcept
     {
+        if (!transport.playing || transport.loopLength == 0)
+        {
+            std::fill_n(out, numFrames, 0.0f);
+            return;
+        }
+
         const float gain = dbToGain(levelDb.load());
+        auto position = transport.position % transport.loopLength;
         for (int i = 0; i < numFrames; ++i)
         {
-            out[i] = gain * samples[position];
-            if (++position == samples.size())
+            out[i] = position < samples.size() ? gain * samples[position] : 0.0f;
+            if (++position == transport.loopLength)
                 position = 0;
         }
     }

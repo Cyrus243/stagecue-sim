@@ -43,6 +43,14 @@ namespace sim
         [[nodiscard]] float consumeInputPeak(int input) noexcept { return inputMeters[clamp(input)].consume(); }
         [[nodiscard]] float consumeOutputPeak(int output) noexcept { return outputMeters[clamp(output)].consume(); }
 
+        /** Song transport shared by every file input. Stopped files are silent;
+            restart() rewinds the song to 0 at the next period. */
+        void setPlaying(bool shouldPlay) noexcept { transportPlaying = shouldPlay; }
+        [[nodiscard]] bool isPlaying() const noexcept { return transportPlaying.load(); }
+        void restart() noexcept { ++restartRequests; }
+        [[nodiscard]] std::uint64_t getSongPositionFrames() const noexcept { return songPosition.load(); }
+        [[nodiscard]] std::uint64_t getSongLengthFrames() const noexcept { return songLength.load(); }
+
         void setMonitorEnabled(int output, bool enabled) noexcept { monitorEnabled[clamp(output)] = enabled; }
         [[nodiscard]] bool isMonitorEnabled(int output) const noexcept { return monitorEnabled[clamp(output)]; }
         void setMonitorMuted(bool muted) noexcept { monitorMuted = muted; }
@@ -74,6 +82,11 @@ namespace sim
         std::array<PeakMeter, kMaxChannels> outputMeters;
         std::array<std::atomic<bool>, kMaxChannels> monitorEnabled {};
         std::atomic<bool> monitorMuted { false };
+
+        std::atomic<bool> transportPlaying { false };
+        std::atomic<std::uint64_t> restartRequests { 0 };
+        std::atomic<std::uint64_t> songPosition { 0 };   // survives stream restarts
+        std::atomic<std::uint64_t> songLength { 0 };
 
         std::unique_ptr<SpscRing> monitorRing;
         std::atomic<std::uint64_t> monitorDropouts { 0 };

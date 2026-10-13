@@ -30,6 +30,7 @@ namespace sim
         unsigned periods = 4;
         std::string cardId = "StageCueSim";
         std::string monitorDevice = "default";
+        bool startPlaying = false;       // --play: start the song transport right away
         std::vector<SourceSpec> sources;
     };
 
