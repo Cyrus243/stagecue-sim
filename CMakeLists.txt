@@ -93,6 +93,7 @@ if(SOUNDCARD_SIM_BUILD_TESTS)
             tests/SourcesTest.cpp
             tests/MetersTest.cpp
             tests/LoopbackStatusTest.cpp
+            tests/EventLogTest.cpp
     )
     target_link_libraries(SoundcardSimTest PRIVATE soundcard_sim_core gtest_main)
     include(GoogleTest)

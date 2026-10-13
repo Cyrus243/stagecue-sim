@@ -1,20 +1,21 @@
 #include "Ui.h"
 
+#include "EventLog.h"
 #include "LoopbackStatus.h"
 #include "Meters.h"
 #include "SimEngine.h"
+#include "UiStyle.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/terminal.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <iomanip>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -23,11 +24,18 @@ namespace sim
     namespace
     {
         using namespace ftxui;
+        using namespace style;
         using Clock = std::chrono::steady_clock;
+        using Severity = EventLog::Severity;
 
         constexpr float kSignalThresholdDb = -60.0f;
         constexpr auto kSignalHold = std::chrono::seconds(1);
         constexpr auto kRefreshInterval = std::chrono::milliseconds(33);   // ~30 Hz, like LevelMeterBroadcaster
+        constexpr int kWideLayoutColumns = 130;   // below this the metrics tiles are hidden
+        constexpr int kTallLayoutRows = 40;       // below this the activity log is hidden
+        constexpr std::size_t kLogLines = 6;
+        constexpr int kMeterCells = 14;
+        constexpr int kNarrowMeterCells = 8;
 
         enum Kind { kSilence = 0, kSine = 1, kFile = 2 };
         const std::vector<std::string> kKindLabels = { "Off", "Sine", "File" };
@@ -47,35 +55,12 @@ namespace sim
             return std::round(hz / scale) * scale;
         }
 
-        std::string fixed(float value, int precision)
-        {
-            std::ostringstream stream;
-            stream << std::fixed << std::setprecision(precision) << value;
-            return stream.str();
-        }
-
-        std::string formatDb(float db) { return db <= kMeterFloorDb ? "  -inf" : fixed(db, 1); }
-
         std::string formatFrequency(float hz)
         {
             return hz >= 1000.0f ? fixed(hz / 1000.0f, 2) + " kHz" : fixed(hz, 0) + " Hz";
         }
 
-        Element meterBar(float db, int width)
-        {
-            const float fraction = std::clamp((db - kMeterFloorDb) / -kMeterFloorDb, 0.0f, 1.0f);
-            const Color barColor = db > -6.0f ? Color::Red : db > -18.0f ? Color::Yellow : Color::Green;
-            return hbox({
-                gauge(fraction) | color(barColor) | size(WIDTH, EQUAL, width),
-                text(formatDb(db) + " dB") | size(WIDTH, EQUAL, 10),
-            });
-        }
-
-        Element badge(bool ok, const std::string& okText, const std::string& badText)
-        {
-            return ok ? text(" " + okText + " ") | bgcolor(Color::Green) | color(Color::Black)
-                      : text(" " + badText + " ") | bgcolor(Color::Red) | color(Color::White);
-        }
+        std::string twoDigits(int value) { return (value < 9 ? "0" : "") + std::to_string(value + 1); }
 
         struct InputRow
         {
@@ -103,6 +88,7 @@ namespace sim
             MeterBallistics meter;
             float meterDb = kMeterFloorDb;
             std::optional<Clock::time_point> lastSignal;
+            bool live = false;
             Component component;
         };
 
@@ -121,49 +107,67 @@ namespace sim
                 outputsContainer = Container::Vertical({});
                 populateRows();
 
-                auto inputsSlider = Slider("", &requestedInputs, 1, kMaxChannels, 1);
-                auto outputsSlider = Slider("", &requestedOutputs, 1, kMaxChannels, 1);
-                auto applyButton = Button("Apply / restart", [this] { applyIoConfig(); }, ButtonOption::Ascii());
-                auto muteCheckbox = Checkbox("mute main out", &monitorMuted);
-                auto quitButton = Button("Quit", screen.ExitLoopClosure(), ButtonOption::Ascii());
+                const auto& config = engine.getConfig();
+                log.add(Severity::Info, "Simulator started: " + std::to_string(engine.getNumInputs()) + " in / "
+                                        + std::to_string(engine.getNumOutputs()) + " out @ "
+                                        + std::to_string(config.sampleRate) + " Hz, period "
+                                        + std::to_string(config.periodFrames));
 
-                auto settings = Container::Horizontal({ inputsSlider, outputsSlider, applyButton, muteCheckbox, quitButton });
-                auto settingsView = Renderer(settings, [=, this] {
-                    return hbox({
-                        text(" Inputs "), inputsSlider->Render() | size(WIDTH, EQUAL, 18),
-                        text(" " + std::to_string(requestedInputs)) | size(WIDTH, EQUAL, 4),
-                        text("  Outputs "), outputsSlider->Render() | size(WIDTH, EQUAL, 18),
-                        text(" " + std::to_string(requestedOutputs)) | size(WIDTH, EQUAL, 4),
-                        text("  "), applyButton->Render(),
-                        text("  "), muteCheckbox->Render(),
-                        filler(),
-                        quitButton->Render(), text(" "),
-                    });
+                auto inputsSlider = Slider(sliderOption(&requestedInputs, 1, kMaxChannels, 1));
+                auto outputsSlider = Slider(sliderOption(&requestedOutputs, 1, kMaxChannels, 1));
+                auto applyButton = Button("Apply / restart", [this] { applyIoConfig(); }, primaryButton());
+                auto muteCheckbox = Checkbox("mute main out", &monitorMuted, checkboxOption());
+                auto quitButton = Button("Quit", screen.ExitLoopClosure(), secondaryButton());
+
+                auto controls = Container::Vertical({
+                    inputsSlider, outputsSlider, muteCheckbox,
+                    Container::Horizontal({ applyButton, quitButton }),
+                });
+                auto controlView = Renderer(controls, [=, this] {
+                    auto countRow = [](const std::string& label, const Component& slider, int value) {
+                        return hbox({
+                            muted(label) | size(WIDTH, EQUAL, 9),
+                            slider->Render() | size(WIDTH, EQUAL, 20),
+                            text(" " + std::to_string(value)) | bold | color(kBright),
+                        });
+                    };
+                    return panel("Control", vbox({
+                        countRow("Inputs", inputsSlider, requestedInputs),
+                        countRow("Outputs", outputsSlider, requestedOutputs),
+                        muteCheckbox->Render(),
+                        hbox({ applyButton->Render(), text("  "), quitButton->Render() }),
+                    }));
                 });
 
                 auto body = Container::Horizontal({ inputsContainer, outputsContainer });
-                auto root = Container::Vertical({ body, settingsView });
+                auto root = Container::Vertical({ body, controlView });
 
                 auto view = Renderer(root, [=, this] {
                     syncWithEngine();
-                    return vbox({
-                        header(),
-                        separator(),
-                        hbox({
-                            vbox({
-                                text(" Inputs (sim → PluginHost)") | bold,
-                                inputsContainer->Render() | vscroll_indicator | yframe,
-                            }) | flex,
-                            separator(),
-                            vbox({
-                                text(" Outputs (PluginHost → sim)") | bold,
-                                outputsContainer->Render() | vscroll_indicator | yframe,
-                            }) | size(WIDTH, GREATER_THAN, 61),
-                        }) | flex,
-                        separator(),
-                        settingsView->Render(),
-                        footer(),
-                    }) | border;
+                    // Narrow terminals drop the metrics tiles, short ones the activity log
+                    // (the control panel then moves up next to the link panel).
+                    const auto terminal = Terminal::Size();
+                    const bool wide = terminal.dimx >= kWideLayoutColumns;
+                    meterCells = wide ? kMeterCells : kNarrowMeterCells;
+                    const bool tall = terminal.dimy >= kTallLayoutRows;
+
+                    Elements top;
+                    if (wide)
+                        top.push_back(metricsPanel() | flex);
+                    top.push_back(linkPanel() | flex);
+                    if (!tall)
+                        top.push_back(controlView->Render());
+
+                    Elements layout {
+                        headerBar(),
+                        hbox(std::move(top)),
+                        hbox({ inputsPanel() | flex, outputsPanel() }) | flex,
+                    };
+                    if (tall)
+                        layout.push_back(hbox({ logPanel() | flex, controlView->Render() }));
+                    layout.push_back(footer());
+
+                    return vbox(std::move(layout)) | bgcolor(kBg) | color(kText);
                 });
 
                 return CatchEvent(view, [this](const Event& event) {
@@ -202,13 +206,11 @@ namespace sim
                 adoptExistingSource(*row);
 
                 auto* r = row.get();
-                auto kindToggle = Toggle(&kKindLabels, &r->kind);
-                auto frequency = Slider("", &r->frequencyPosition, 0, 100, 1);
-                auto level = Slider("", &r->levelDb, -60.0f, 0.0f, 1.0f);
+                auto kindToggle = Menu(&kKindLabels, &r->kind, toggleOption());
+                auto frequency = Slider(sliderOption(&r->frequencyPosition, 0, 100, 1));
+                auto level = Slider(sliderOption(&r->levelDb, -60.0f, 0.0f, 1.0f));
 
-                InputOption pathOption;
-                pathOption.multiline = false;
-                pathOption.placeholder = "path/to/file.wav (Enter to load)";
+                InputOption pathOption = inputOption("path/to/file.wav (Enter to load)");
                 pathOption.on_enter = [this, r] { loadFile(*r); };
                 auto path = Input(&r->path, pathOption);
 
@@ -219,36 +221,35 @@ namespace sim
                     Maybe(level, [r] { return r->kind != kSilence; }),
                 });
 
-                row->component = Renderer(container, [=] {
-                    Element params = text("") | size(WIDTH, EQUAL, 52);
+                row->component = Renderer(container, [=, this] {
+                    auto levelControl = [&] {
+                        return hbox({
+                            muted("  lvl "), level->Render() | size(WIDTH, EQUAL, 10),
+                            text(" " + fixed(r->levelDb, 0) + " dB") | size(WIDTH, EQUAL, 7),
+                        });
+                    };
+
+                    Element params = muted("—");
                     if (r->kind == kSine)
                         params = hbox({
-                            frequency->Render() | size(WIDTH, EQUAL, 16),
-                            text(" " + formatFrequency(r->frequencyHz)) | size(WIDTH, EQUAL, 11),
-                            text(" lvl "), level->Render() | size(WIDTH, EQUAL, 12),
-                            text(" " + fixed(r->levelDb, 0) + " dB") | size(WIDTH, EQUAL, 8),
+                            frequency->Render() | size(WIDTH, EQUAL, 14),
+                            text(" " + formatFrequency(r->frequencyHz)) | color(kBright) | size(WIDTH, EQUAL, 10),
+                            levelControl(),
                         });
                     else if (r->kind == kFile)
-                        params = hbox({
-                            path->Render() | size(WIDTH, EQUAL, 27),
-                            text(" lvl "), level->Render() | size(WIDTH, EQUAL, 12),
-                            text(" " + fixed(r->levelDb, 0) + " dB") | size(WIDTH, EQUAL, 8),
-                        });
+                        params = hbox({ path->Render() | size(WIDTH, EQUAL, 25), levelControl() });
 
-                    auto statusLine = text("      " + r->status) | dim;
-                    if (r->statusIsError)
-                        statusLine = text("      " + r->status) | color(Color::Red);
-
-                    return vbox({
-                        hbox({
-                            text(" In " + std::to_string(r->index + 1)) | bold | size(WIDTH, EQUAL, 7),
-                            kindToggle->Render() | size(WIDTH, EQUAL, 16),
-                            params,
-                            text(" "),
-                            meterBar(r->meterDb, 10),
-                        }),
-                        statusLine,
-                    });
+                    Elements lines;
+                    lines.push_back(hbox({
+                        text(twoDigits(r->index)) | bold | color(kBright) | size(WIDTH, EQUAL, 4),
+                        kindToggle->Render() | size(WIDTH, EQUAL, 21),
+                        params | flex,
+                        text(" "),
+                        segmentedMeter(r->meterDb, meterCells),
+                    }));
+                    if (!r->status.empty())
+                        lines.push_back(hbox({ muted("    > "), text(r->status) | color(r->statusIsError ? kRed : kMuted) }));
+                    return vbox(std::move(lines));
                 });
                 return row;
             }
@@ -287,29 +288,25 @@ namespace sim
                 row->monitor = engine.isMonitorEnabled(index);
 
                 auto* r = row.get();
-                auto monitor = Checkbox("main out", &r->monitor);
-                row->component = Renderer(monitor, [=] {
-                    const auto now = Clock::now();
-                    const bool active = r->lastSignal && now - *r->lastSignal < kSignalHold;
-
+                auto monitor = Checkbox(std::string("main ") + (index % 2 == 0 ? "L" : "R"), &r->monitor, checkboxOption());
+                row->component = Renderer(monitor, [=, this] {
                     std::string ago = "never";
                     if (r->lastSignal)
                     {
-                        const auto seconds = std::chrono::duration<float>(now - *r->lastSignal).count();
-                        ago = active ? "now" : fixed(seconds, 0) + "s ago";
+                        const auto seconds = std::chrono::duration<float>(Clock::now() - *r->lastSignal).count();
+                        ago = r->live ? "now" : fixed(seconds, 0) + "s ago";
                     }
 
-                    auto signal = active ? text(" ● SIGNAL ") | bgcolor(Color::Green) | color(Color::Black) | bold
-                                         : text(" ○ idle   ") | dim;
-                    auto side = text(r->index % 2 == 0 ? "L" : "R") | dim;
-
-                    return hbox({
-                        text(" Out " + std::to_string(r->index + 1)) | bold | size(WIDTH, EQUAL, 8),
-                        meterBar(r->meterDb, 10),
-                        signal,
-                        text(" " + ago) | dim | size(WIDTH, EQUAL, 9),
-                        monitor->Render(), text(" "), side,
-                    });
+                    Elements cells {
+                        text(twoDigits(r->index)) | bold | color(kBright) | size(WIDTH, EQUAL, 4),
+                        segmentedMeter(r->meterDb, meterCells),
+                        text("  "),
+                        statusDot(r->live ? Dot::Live : Dot::Idle, r->live ? "Signal" : "Idle") | size(WIDTH, EQUAL, 9),
+                    };
+                    if (meterCells == kMeterCells)
+                        cells.push_back(muted(ago) | size(WIDTH, EQUAL, 8));
+                    cells.push_back(monitor->Render());
+                    return hbox(std::move(cells));
                 });
                 return row;
             }
@@ -324,6 +321,7 @@ namespace sim
                 {
                     row.status = error;
                     row.statusIsError = true;
+                    log.add(Severity::Error, "In " + std::to_string(row.index + 1) + ": " + error);
                     return;
                 }
 
@@ -333,6 +331,7 @@ namespace sim
                 engine.setInputSource(row.index, row.file);
                 row.status = row.file->describe();
                 row.statusIsError = false;
+                log.add(Severity::Ok, "In " + std::to_string(row.index + 1) + " loaded " + row.status);
             }
 
             void applyIoConfig()
@@ -343,11 +342,10 @@ namespace sim
                 populateRows();
 
                 if (error.empty())
-                    flash = "Restarted with " + std::to_string(requestedInputs) + " in / "
-                            + std::to_string(requestedOutputs) + " out - re-select the device in PluginHost.";
+                    log.add(Severity::Ok, "Restarted with " + std::to_string(requestedInputs) + " in / "
+                                          + std::to_string(requestedOutputs) + " out - re-select the device in PluginHost");
                 else
-                    flash = error;
-                flashIsError = !error.empty();
+                    log.add(Severity::Error, error);
             }
 
             /** Pushes UI edits to the engine and pulls meters out of it. Runs every frame. */
@@ -366,6 +364,7 @@ namespace sim
                     row.meterDb = row.meter.update(engine.consumeInputPeak(i), interval);
                 }
 
+                liveOutputs = 0;
                 for (int i = 0; i < engine.getNumOutputs(); ++i)
                 {
                     auto& row = *outputRows[static_cast<std::size_t>(i)];
@@ -375,13 +374,79 @@ namespace sim
                     if (gainToDb(peak) > kSignalThresholdDb)
                         row.lastSignal = now;
                     row.meterDb = row.meter.update(peak, interval);
+
+                    const bool live = row.lastSignal && now - *row.lastSignal < kSignalHold;
+                    if (live && !row.live)
+                        log.add(Severity::Ok, "Out " + std::to_string(i + 1) + " signal detected");
+                    row.live = live;
+                    liveOutputs += live ? 1 : 0;
                 }
 
                 if (now - lastStatusPoll > std::chrono::milliseconds(250))
                 {
+                    const auto previous = loopback;
                     loopback = queryLoopbackStatus(engine.getConfig().cardId);
                     lastStatusPoll = now;
+                    logStatusChanges(previous);
                 }
+            }
+
+            /** Adds activity-log entries for whatever changed since the last status poll. */
+            void logStatusChanges(const LoopbackStatus& previous)
+            {
+                const auto& cardId = engine.getConfig().cardId;
+                if (loopback.cardPresent != previous.cardPresent)
+                    log.add(loopback.cardPresent ? Severity::Ok : Severity::Error,
+                            "Loopback card " + cardId + (loopback.cardPresent ? " found" : " missing"));
+
+                logSubstreamChange("input", previous.appCapture, loopback.appCapture, engine.getNumInputs());
+                logSubstreamChange("output", previous.appPlayback, loopback.appPlayback, engine.getNumOutputs());
+
+                const bool running = engine.isRunning();
+                if (running != wasRunning)
+                    log.add(running ? Severity::Ok : Severity::Error, running ? "Engine running" : "Engine stopped");
+                wasRunning = running;
+
+                const auto loopbackXruns = engine.getLoopbackXruns();
+                if (loopbackXruns > lastLoopbackXruns)
+                    log.add(Severity::Error, "Loopback xrun (+" + std::to_string(loopbackXruns - lastLoopbackXruns) + ")");
+                lastLoopbackXruns = loopbackXruns;
+
+                const auto monitorXruns = engine.getMonitorXruns();
+                if (monitorXruns > lastMonitorXruns)
+                    log.add(Severity::Warn, "Main out xrun (+" + std::to_string(monitorXruns - lastMonitorXruns) + ")");
+                lastMonitorXruns = monitorXruns;
+
+                const auto lastError = engine.getLastError();
+                if (lastError != lastEngineError && !lastError.empty())
+                    log.add(Severity::Error, lastError);
+                lastEngineError = lastError;
+
+                const auto monitorError = engine.getMonitorError();
+                if (monitorError != lastMonitorError && !monitorError.empty())
+                    log.add(Severity::Warn, "Main out: " + monitorError);
+                lastMonitorError = monitorError;
+            }
+
+            void logSubstreamChange(const std::string& direction, const SubstreamStatus& before,
+                                    const SubstreamStatus& after, int expectedChannels)
+            {
+                if (after.open == before.open && after.channels == before.channels)
+                    return;
+
+                if (!after.open)
+                {
+                    log.add(Severity::Info, "PluginHost closed " + direction);
+                    return;
+                }
+
+                std::string details = after.channels > 0
+                                          ? " (" + std::to_string(after.channels) + " ch, " + std::to_string(after.rate) + " Hz)"
+                                          : "";
+                const bool mismatch = after.channels > 0 && after.channels != expectedChannels;
+                log.add(mismatch ? Severity::Warn : Severity::Ok,
+                        "PluginHost opened " + direction + details
+                            + (mismatch ? " - sim has " + std::to_string(expectedChannels) + " ch" : ""));
             }
 
             void applyInputRow(InputRow& row)
@@ -438,79 +503,155 @@ namespace sim
                 }
             }
 
-            // -------------------------------------------------------- chrome
+            // -------------------------------------------------------- panels
 
-            Element substream(const std::string& label, const SubstreamStatus& status, int expectedChannels)
+            Element headerBar()
             {
+                const auto& config = engine.getConfig();
+                const auto lastError = engine.getLastError();
+                const bool running = engine.isRunning();
+
+                Elements lines;
+                lines.push_back(hbox({
+                    text("STAGECUE SOUNDCARD SIM") | bold | color(kBright),
+                    text("  "), tag("loopback sim"),
+                    filler(),
+                    muted("Card "), chip(loopback.cardPresent, "online", "missing"),
+                    muted("   Engine "), chip(running, "running", "stopped"),
+                    muted("   Local time "), text(EventLog::clockTime()) | color(kText),
+                }));
+                lines.push_back(separatorLight() | color(kPanelBorder));
+                lines.push_back(hbox({
+                    labelValue("Card", config.cardId), text("  "),
+                    labelValue("Rate", std::to_string(config.sampleRate)), text("  "),
+                    labelValue("Period", std::to_string(config.periodFrames)), text("  "),
+                    labelValue("Format", running ? engine.getLoopbackFormat() : "-"),
+                    filler(),
+                }));
+
+                if (!loopback.cardPresent)
+                    lines.push_back(text("Loopback card not found - run ./setup-loopback.sh (sudo modprobe snd-aloop id="
+                                         + config.cardId + " pcm_substreams=1)") | color(kAmber));
+                if (!lastError.empty())
+                    lines.push_back(paragraph(lastError) | color(kRed));
+
+                return padded(vbox(std::move(lines))) | borderStyled(LIGHT, kPanelBorder);
+            }
+
+            Element metricsPanel()
+            {
+                const auto xruns = engine.getLoopbackXruns() + engine.getMonitorXruns();
+                return panel("Device metrics", hbox({
+                    kpiTile(std::to_string(engine.getNumInputs()), "Inputs"),
+                    text(" "),
+                    kpiTile(std::to_string(engine.getNumOutputs()), "Outputs"),
+                    text(" "),
+                    kpiTile(std::to_string(liveOutputs), "Live outputs", liveOutputs > 0 ? kGreen : kBright),
+                    text(" "),
+                    kpiTile(std::to_string(xruns), "Xruns", xruns > 0 ? kRed : kBright),
+                }));
+            }
+
+            Element substreamRow(const std::string& label, const SubstreamStatus& status, int expectedChannels)
+            {
+                Elements cells { muted(label) | size(WIDTH, EQUAL, 10) };
                 if (!status.open)
-                    return hbox({ text(label), badge(false, "", "not connected") });
+                {
+                    cells.push_back(statusDot(Dot::Idle, "NOT CONNECTED"));
+                    return hbox(std::move(cells));
+                }
+
+                const bool mismatch = status.channels > 0 && status.channels != expectedChannels;
+                cells.push_back(statusDot(mismatch ? Dot::Warn : Dot::Live, "CONNECTED") | size(WIDTH, EQUAL, 14));
 
                 std::string details = status.state;
                 if (status.channels > 0)
                     details += " · " + std::to_string(status.channels) + " ch · " + std::to_string(status.rate) + " Hz";
-
-                auto element = hbox({ text(label), badge(true, "connected", ""), text(" " + details) | dim });
-                if (status.channels > 0 && status.channels != expectedChannels)
-                    element = hbox({ element, text("  (sim has " + std::to_string(expectedChannels) + " ch)") | color(Color::Yellow) });
-                return element;
+                cells.push_back(muted(details));
+                if (mismatch)
+                    cells.push_back(text("  sim has " + std::to_string(expectedChannels) + " ch") | color(kAmber));
+                return hbox(std::move(cells));
             }
 
-            Element header()
+            Element linkPanel()
             {
                 const auto& config = engine.getConfig();
-                const auto lastError = engine.getLastError();
                 const auto monitorError = engine.getMonitorError();
 
+                Element mainOut = engine.isRunning()
+                                      ? chip(engine.isMonitorOpen() && monitorError.empty(), "ok", "unavailable")
+                                      : muted("(engine stopped)");
+
+                return panel("PluginHost link", vbox({
+                    hbox({ muted("Select "), text("StageCue Soundcard Sim") | bold | color(kBright),
+                           muted(" as input and output device") }),
+                    muted("ALSA alias stagecue_sim → " + appPcmName(config)),
+                    substreamRow("Input", loopback.appCapture, engine.getNumInputs()),
+                    substreamRow("Output", loopback.appPlayback, engine.getNumOutputs()),
+                    hbox({
+                        muted("Main out") | size(WIDTH, EQUAL, 10),
+                        text(config.monitorDevice) | color(kText), text("  "), mainOut,
+                        muted("   xruns " + std::to_string(engine.getMonitorXruns())
+                              + " · dropouts " + std::to_string(engine.getMonitorDropouts())),
+                    }),
+                }));
+            }
+
+            Element inputsPanel()
+            {
+                auto header = hbox({
+                    headerCell("Ch", 4), headerCell("Source", 21), headerCell("Parameters", 0),
+                    headerCell("Level", meterCells + 7),
+                });
+                return panel("Inputs", vbox({
+                    header,
+                    separatorLight() | color(kPanelBorder),
+                    inputsContainer->Render() | vscroll_indicator | yframe | flex,
+                }), "sim → PluginHost");
+            }
+
+            Element outputsPanel()
+            {
+                Elements columns { headerCell("Ch", 4), headerCell("Level", meterCells + 8), headerCell("Status", 9) };
+                if (meterCells == kMeterCells)
+                    columns.push_back(headerCell("Last", 8));
+                columns.push_back(headerCell("Monitor", 10));
+                auto header = hbox(std::move(columns));
+                return panel("Outputs", vbox({
+                    header,
+                    separatorLight() | color(kPanelBorder),
+                    outputsContainer->Render() | vscroll_indicator | yframe | flex,
+                }), "PluginHost → sim");
+            }
+
+            Element logPanel()
+            {
+                const auto& entries = log.getEntries();
+                const std::size_t first = entries.size() > kLogLines ? entries.size() - kLogLines : 0;
+
                 Elements lines;
-                lines.push_back(hbox({
-                    text(" StageCue Soundcard Sim ") | bold | inverted,
-                    text("  card "), badge(loopback.cardPresent, config.cardId, config.cardId + " missing"),
-                    text("  engine "), badge(engine.isRunning(), "running", "stopped"),
-                    text("  " + std::to_string(config.sampleRate) + " Hz · " + std::to_string(config.periodFrames)
-                         + " frames" + (engine.isRunning() ? " · " + engine.getLoopbackFormat() : "")) | dim,
-                }));
+                for (std::size_t i = first; i < entries.size(); ++i)
+                {
+                    const auto& entry = entries[i];
+                    const Color textColor = entry.severity == Severity::Ok     ? kGreen
+                                          : entry.severity == Severity::Warn  ? kAmber
+                                          : entry.severity == Severity::Error ? kRed
+                                                                              : kText;
+                    lines.push_back(hbox({ muted("> [" + entry.time + "] "), text(entry.text) | color(textColor) }));
+                }
+                while (lines.size() < kLogLines)
+                    lines.push_back(text(""));
 
-                if (!loopback.cardPresent)
-                    lines.push_back(text(" Loopback card not found - run ./setup-loopback.sh (sudo modprobe snd-aloop id="
-                                         + config.cardId + " pcm_substreams=1)") | color(Color::Yellow));
-
-                lines.push_back(hbox({
-                    text(" In PluginHost select "), text("StageCue Soundcard Sim") | bold,
-                    text(" as input and output device") ,
-                    text("  (ALSA alias stagecue_sim → " + appPcmName(config) + ")") | dim,
-                }));
-
-                lines.push_back(hbox({
-                    substream(" PluginHost input:  ", loopback.appCapture, engine.getNumInputs()),
-                }));
-                lines.push_back(hbox({
-                    substream(" PluginHost output: ", loopback.appPlayback, engine.getNumOutputs()),
-                }));
-
-                lines.push_back(hbox({
-                    text(" main out "), text(config.monitorDevice) | bold, text("  "),
-                    engine.isRunning() ? badge(engine.isMonitorOpen() && monitorError.empty(), "ok", "unavailable")
-                                       : text("(engine stopped)") | dim,
-                    text("   xruns: loopback " + std::to_string(engine.getLoopbackXruns())
-                         + " · main out " + std::to_string(engine.getMonitorXruns())
-                         + " · main-out dropouts " + std::to_string(engine.getMonitorDropouts())) | dim,
-                }));
-
-                if (!lastError.empty())
-                    lines.push_back(paragraph(" " + lastError) | color(Color::Red));
-                if (!monitorError.empty())
-                    lines.push_back(text(" main out: " + monitorError) | color(Color::Yellow));
-
-                return vbox(std::move(lines));
+                return panel("Activity log", vbox(std::move(lines)));
             }
 
             Element footer()
             {
-                Elements lines;
-                if (!flash.empty())
-                    lines.push_back(paragraph(" " + flash) | color(flashIsError ? Color::Red : Color::Green));
-                lines.push_back(text(" Tab/arrows: move · ←/→: adjust · Enter: load file · Esc or Ctrl+C: quit") | dim);
-                return vbox(std::move(lines));
+                return hbox({
+                    muted(" Tab/arrows: move · ←/→: adjust · Enter: load file · Esc or Ctrl+C: quit"),
+                    filler(),
+                    text("▌") | color(kBlue), muted("Ready "),
+                });
             }
 
             SimEngine& engine;
@@ -524,8 +665,15 @@ namespace sim
             int requestedInputs;
             int requestedOutputs;
             bool monitorMuted = false;
-            std::string flash;
-            bool flashIsError = false;
+            int liveOutputs = 0;
+            int meterCells = kMeterCells;
+
+            EventLog log;
+            bool wasRunning = false;
+            std::uint64_t lastLoopbackXruns = 0;
+            std::uint64_t lastMonitorXruns = 0;
+            std::string lastEngineError;
+            std::string lastMonitorError;
 
             LoopbackStatus loopback;
             Clock::time_point lastStatusPoll {};
