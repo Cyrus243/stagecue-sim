@@ -27,6 +27,28 @@ TEST(SimConfig, DefaultsMatchPluginHostDeviceDefaults)
     EXPECT_EQ(appPcmName(*result.config), "hw:CARD=StageCueSim,DEV=1");
 }
 
+#if defined(__APPLE__)
+TEST(SimConfig, ParsesIoCountsAndDevices)
+{
+    const auto result = parse({ "--inputs", "4", "--outputs", "2", "--inputs-device", "BlackHole 16ch",
+                                "--outputs-device", "BlackHole 2ch", "--monitor", "MacBook Pro Speakers" });
+    ASSERT_TRUE(result.config);
+    EXPECT_EQ(result.config->numInputs, 4);
+    EXPECT_EQ(result.config->numOutputs, 2);
+    EXPECT_EQ(result.config->inputsDevice, "BlackHole 16ch");
+    EXPECT_EQ(result.config->outputsDevice, "BlackHole 2ch");
+    EXPECT_EQ(result.config->monitorDevice, "MacBook Pro Speakers");
+}
+
+TEST(SimConfig, DefaultsToTheStageCueLoopbackDevices)
+{
+    const auto result = parse({});
+    ASSERT_TRUE(result.config);
+    EXPECT_EQ(result.config->inputsDevice, "StageCue Sim Inputs");
+    EXPECT_EQ(result.config->outputsDevice, "StageCue Sim Outputs");
+    EXPECT_FALSE(parse({ "--card", "Foo" }).config);
+}
+#else
 TEST(SimConfig, ParsesIoCountsAndDevices)
 {
     const auto result = parse({ "--inputs", "4", "--outputs", "2", "--card", "Foo", "--monitor", "pipewire" });
@@ -35,7 +57,9 @@ TEST(SimConfig, ParsesIoCountsAndDevices)
     EXPECT_EQ(result.config->numOutputs, 2);
     EXPECT_EQ(result.config->cardId, "Foo");
     EXPECT_EQ(result.config->monitorDevice, "pipewire");
+    EXPECT_EQ(simPcmName(*result.config), "hw:CARD=Foo,DEV=0");
 }
+#endif
 
 TEST(SimConfig, TransportStartsStoppedUnlessPlayIsGiven)
 {
@@ -45,6 +69,12 @@ TEST(SimConfig, TransportStartsStoppedUnlessPlayIsGiven)
     ASSERT_TRUE(result.config);
     EXPECT_TRUE(result.config->startPlaying);
     EXPECT_EQ(result.config->numInputs, 2);
+}
+
+TEST(SimConfig, HeadlessIsOptIn)
+{
+    EXPECT_FALSE(parse({}).config->headless);
+    EXPECT_TRUE(parse({ "--headless" }).config->headless);
 }
 
 TEST(SimConfig, RejectsOutOfRangeChannelCounts)

@@ -6,7 +6,7 @@
 
 namespace sim
 {
-    // snd-aloop supports 1..32 channels per stream.
+    // snd-aloop supports 1..32 channels per stream; the macOS loopback devices have 32.
     constexpr int kMaxChannels = 32;
 
     /** A source requested on the command line, e.g. `--source 1=sine:1000:-12`. */
@@ -28,7 +28,10 @@ namespace sim
         unsigned sampleRate = 48000;     // PluginHost's DeviceManager default
         unsigned periodFrames = 512;     // PluginHost's DeviceManager default buffer size
         unsigned periods = 4;
-        std::string cardId = "StageCueSim";
+        bool headless = false;           // --headless: no TUI, periodic status lines
+        std::string cardId = "StageCueSim";                 // Linux: snd-aloop card id
+        std::string inputsDevice = "StageCue Sim Inputs";   // macOS: sim -> PluginHost loopback device
+        std::string outputsDevice = "StageCue Sim Outputs"; // macOS: PluginHost -> sim loopback device
         std::string monitorDevice = "default";
         bool startPlaying = false;       // --play: start the song transport right away
         std::vector<SourceSpec> sources;
@@ -38,6 +41,17 @@ namespace sim
     [[nodiscard]] std::string simPcmName(const SimConfig& config);
     /** ALSA name PluginHost should open (device 1). */
     [[nodiscard]] std::string appPcmName(const SimConfig& config);
+
+    /** Platform-specific wording for the UI. */
+    struct DeviceText
+    {
+        std::string device;       // header "Card" value
+        std::string selectInput;  // what to pick as PluginHost's input device
+        std::string selectOutput; // ... and as its output device
+        std::string detail;       // one muted line under the instructions
+        std::string missingHint;  // shown while the loopback device is missing
+    };
+    [[nodiscard]] DeviceText deviceText(const SimConfig& config);
 
     /** Parses `index=kind[:args]` (1-based index), e.g. `2=file:/tmp/kick.wav:-6`. */
     [[nodiscard]] std::optional<SourceSpec> parseSourceSpec(const std::string& text, std::string& error);

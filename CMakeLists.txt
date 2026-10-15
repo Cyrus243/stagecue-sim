@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 project(StageCueSoundcardSim VERSION 0.1.0 LANGUAGES C CXX)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "StageCueSoundcardSim relies on ALSA snd-aloop and only builds on Linux")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT APPLE)
+    message(FATAL_ERROR "StageCueSoundcardSim builds on Linux (ALSA snd-aloop) and macOS (CoreAudio) only")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -19,12 +19,12 @@ if(NOT COMMAND CPMAddPackage)
     include(cmake/cpm.cmake)
 endif()
 
-# Single-header WAV/AIFF/FLAC decoders (public domain / MIT-0).
+# Single-header audio I/O (ALSA, CoreAudio), decoding (WAV/FLAC/MP3) and resampling (public domain / MIT-0).
 CPMAddPackage(
-    NAME dr_libs
-    GITHUB_REPOSITORY mackron/dr_libs
-    GIT_TAG dfe8377631000664666519fdb83da193fd8037f4
-    SOURCE_DIR ${LIB_DIR}/dr_libs
+    NAME miniaudio
+    GITHUB_REPOSITORY mackron/miniaudio
+    GIT_TAG 0.11.25
+    SOURCE_DIR ${LIB_DIR}/miniaudio
     DOWNLOAD_ONLY YES
 )
 
@@ -44,25 +44,40 @@ if(NOT TARGET ftxui::component)
     )
 endif()
 
-find_package(ALSA REQUIRED)
 find_package(Threads REQUIRED)
 
 # Everything except the UI and main(), shared by the app and the tests.
 add_library(soundcard_sim_core STATIC
-        src/AlsaPcm.cpp
-        src/AudioFileDecoder.cpp
+        src/AudioIo.cpp
         src/LoopbackStatus.cpp
+        src/Mixer.cpp
         src/SimConfig.cpp
         src/SimEngine.cpp
         src/Sources.cpp
+        src/StatusPoller.cpp
+        src/miniaudio.c
 )
 target_include_directories(soundcard_sim_core PUBLIC src)
-target_include_directories(soundcard_sim_core SYSTEM PRIVATE ${dr_libs_SOURCE_DIR})
-target_link_libraries(soundcard_sim_core
-        PUBLIC
-        ALSA::ALSA
-        Threads::Threads
-)
+target_include_directories(soundcard_sim_core SYSTEM PUBLIC ${miniaudio_SOURCE_DIR})
+target_link_libraries(soundcard_sim_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+
+# Platform seam: CoreAudio on macOS, ALSA on Linux. miniaudio links them directly
+# (MA_NO_RUNTIME_LINKING in src/miniaudio.c) instead of dlopen()ing them.
+if(APPLE)
+    target_sources(soundcard_sim_core PRIVATE
+            src/platform/CoreAudioDevices.cpp
+            src/platform/PlatformMac.cpp
+    )
+    target_link_libraries(soundcard_sim_core PUBLIC
+            "-framework CoreAudio"
+            "-framework AudioToolbox"
+            "-framework CoreFoundation"
+    )
+else()
+    find_package(ALSA REQUIRED)
+    target_sources(soundcard_sim_core PRIVATE src/platform/PlatformLinux.cpp)
+    target_link_libraries(soundcard_sim_core PUBLIC ALSA::ALSA m)
+endif()
 
 add_executable(StageCueSoundcardSim
         src/main.cpp
@@ -94,6 +109,8 @@ if(SOUNDCARD_SIM_BUILD_TESTS)
             tests/MetersTest.cpp
             tests/LoopbackStatusTest.cpp
             tests/EventLogTest.cpp
+            tests/MixerTest.cpp
+            tests/SourceSlotsTest.cpp
     )
     target_link_libraries(SoundcardSimTest PRIVATE soundcard_sim_core gtest_main)
     include(GoogleTest)

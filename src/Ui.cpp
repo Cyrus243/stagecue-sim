@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <future>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -30,7 +31,9 @@ namespace sim
 
         constexpr float kSignalThresholdDb = -60.0f;
         constexpr auto kSignalHold = std::chrono::seconds(1);
-        constexpr auto kRefreshInterval = std::chrono::milliseconds(33);   // ~30 Hz, like LevelMeterBroadcaster
+        // 20 Hz: smooth enough for meters. FTXUI repaints the whole screen every frame,
+        // so each extra frame costs the terminal emulator real work.
+        constexpr auto kRefreshInterval = std::chrono::milliseconds(50);
         constexpr int kWideLayoutColumns = 130;   // below this the metrics tiles are hidden
         constexpr int kTallLayoutRows = 40;       // below this the activity log is hidden
         constexpr std::size_t kLogLines = 6;
@@ -62,6 +65,13 @@ namespace sim
 
         std::string twoDigits(int value) { return (value < 9 ? "0" : "") + std::to_string(value + 1); }
 
+        /** Result of a file decoded off the UI thread. */
+        struct LoadResult
+        {
+            std::shared_ptr<FileSource> file;
+            std::string error;
+        };
+
         struct InputRow
         {
             int index = 0;
@@ -76,6 +86,7 @@ namespace sim
             bool statusIsError = false;
             std::shared_ptr<SineSource> sine;
             std::shared_ptr<FileSource> file;
+            std::future<LoadResult> pendingLoad;
             MeterBallistics meter;
             float meterDb = kMeterFloorDb;
             Component component;
@@ -176,6 +187,11 @@ namespace sim
                 });
 
                 return CatchEvent(view, [this](const Event& event) {
+                    if (event == Event::Custom)
+                    {
+                        framePending = false;   // let the ticker post the next one
+                        return false;
+                    }
                     if (event == Event::Escape)
                     {
                         screen.Exit();
@@ -184,6 +200,9 @@ namespace sim
                     return false;
                 });
             }
+
+            /** Set when a redraw tick is queued; the ticker never queues a second one. */
+            std::atomic<bool> framePending { false };
 
         private:
             // ------------------------------------------------------------ rows
@@ -318,19 +337,39 @@ namespace sim
 
             // ------------------------------------------------------- actions
 
+            /** Decodes on a worker thread; finishLoad() picks the result up on a later frame. */
             void loadFile(InputRow& row)
             {
-                std::string error;
-                auto file = FileSource::load(row.path, engine.getConfig().sampleRate, row.levelDb, error);
-                if (!file)
+                if (row.pendingLoad.valid())
+                    return;
+
+                row.status = "loading " + row.path + " ...";
+                row.statusIsError = false;
+                row.pendingLoad = std::async(std::launch::async,
+                                             [path = row.path, rate = engine.getConfig().sampleRate, level = row.levelDb] {
+                                                 LoadResult result;
+                                                 result.file = FileSource::load(path, rate, level, result.error);
+                                                 return result;
+                                             });
+            }
+
+            void finishLoad(InputRow& row)
+            {
+                if (!row.pendingLoad.valid()
+                    || row.pendingLoad.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                    return;
+
+                auto result = row.pendingLoad.get();
+                if (!result.file)
                 {
-                    row.status = error;
+                    row.status = result.error;
                     row.statusIsError = true;
-                    log.add(Severity::Error, "In " + std::to_string(row.index + 1) + ": " + error);
+                    log.add(Severity::Error, "In " + std::to_string(row.index + 1) + ": " + result.error);
                     return;
                 }
 
-                row.file = std::move(file);
+                row.file = std::move(result.file);
+                row.file->setLevelDb(row.levelDb);
                 row.kind = kFile;
                 row.appliedKind = kFile;
                 engine.setInputSource(row.index, row.file);
@@ -387,12 +426,14 @@ namespace sim
                 const double interval = lastSync ? std::chrono::duration<double>(now - *lastSync).count() : 0.0;
                 lastSync = now;
 
+                engine.housekeeping();
                 engine.setMonitorMuted(monitorMuted);
                 playLabel = engine.isPlaying() ? "■ Stop" : "▶ Play";
 
                 for (int i = 0; i < engine.getNumInputs(); ++i)
                 {
                     auto& row = *inputRows[static_cast<std::size_t>(i)];
+                    finishLoad(row);
                     applyInputRow(row);
                     row.meterDb = row.meter.update(engine.consumeInputPeak(i), interval);
                 }
@@ -415,10 +456,11 @@ namespace sim
                     liveOutputs += live ? 1 : 0;
                 }
 
+                // The poller refreshes the status in the background; this only copies it.
                 if (now - lastStatusPoll > std::chrono::milliseconds(250))
                 {
                     const auto previous = loopback;
-                    loopback = queryLoopbackStatus(engine.getConfig().cardId);
+                    loopback = engine.getLinkStatus();
                     lastStatusPoll = now;
                     logStatusChanges(previous);
                 }
@@ -427,10 +469,10 @@ namespace sim
             /** Adds activity-log entries for whatever changed since the last status poll. */
             void logStatusChanges(const LoopbackStatus& previous)
             {
-                const auto& cardId = engine.getConfig().cardId;
                 if (loopback.cardPresent != previous.cardPresent)
                     log.add(loopback.cardPresent ? Severity::Ok : Severity::Error,
-                            "Loopback card " + cardId + (loopback.cardPresent ? " found" : " missing"));
+                            "Loopback " + deviceText(engine.getConfig()).device
+                                + (loopback.cardPresent ? " found" : " missing"));
 
                 logSubstreamChange("input", previous.appCapture, loopback.appCapture, engine.getNumInputs());
                 logSubstreamChange("output", previous.appPlayback, loopback.appPlayback, engine.getNumOutputs());
@@ -439,6 +481,13 @@ namespace sim
                 if (running != wasRunning)
                     log.add(running ? Severity::Ok : Severity::Error, running ? "Engine running" : "Engine stopped");
                 wasRunning = running;
+
+                const bool stalled = engine.isStalled();
+                if (stalled && !wasStalled)
+                    log.add(Severity::Error, "Loopback stalled: no audio callbacks for over a second");
+                else if (!stalled && wasStalled)
+                    log.add(Severity::Ok, "Loopback running again");
+                wasStalled = stalled;
 
                 const auto loopbackXruns = engine.getLoopbackXruns();
                 if (loopbackXruns > lastLoopbackXruns)
@@ -550,12 +599,12 @@ namespace sim
                     text("  "), tag("loopback sim"),
                     filler(),
                     muted("Card "), chip(loopback.cardPresent, "online", "missing"),
-                    muted("   Engine "), chip(running, "running", "stopped"),
+                    muted("   Engine "), engine.isStalled() ? chip(false, "", "stalled") : chip(running, "running", "stopped"),
                     muted("   Local time "), text(EventLog::clockTime()) | color(kText),
                 }));
                 lines.push_back(separatorLight() | color(kPanelBorder));
                 lines.push_back(hbox({
-                    labelValue("Card", config.cardId), text("  "),
+                    labelValue("Card", deviceText(config).device), text("  "),
                     labelValue("Rate", std::to_string(config.sampleRate)), text("  "),
                     labelValue("Period", std::to_string(config.periodFrames)), text("  "),
                     labelValue("Format", running ? engine.getLoopbackFormat() : "-"),
@@ -563,8 +612,7 @@ namespace sim
                 }));
 
                 if (!loopback.cardPresent)
-                    lines.push_back(text("Loopback card not found - run ./setup-loopback.sh (sudo modprobe snd-aloop id="
-                                         + config.cardId + " pcm_substreams=1)") | color(kAmber));
+                    lines.push_back(text(deviceText(config).missingHint) | color(kAmber));
                 if (!lastError.empty())
                     lines.push_back(paragraph(lastError) | color(kRed));
 
@@ -600,6 +648,8 @@ namespace sim
                 std::string details = status.state;
                 if (status.channels > 0)
                     details += " · " + std::to_string(status.channels) + " ch · " + std::to_string(status.rate) + " Hz";
+                else if (status.rate > 0)
+                    details += " · " + std::to_string(status.rate) + " Hz";
                 cells.push_back(muted(details));
                 if (mismatch)
                     cells.push_back(text("  sim has " + std::to_string(expectedChannels) + " ch") | color(kAmber));
@@ -615,10 +665,16 @@ namespace sim
                                       ? chip(engine.isMonitorOpen() && monitorError.empty(), "ok", "unavailable")
                                       : muted("(engine stopped)");
 
+                const auto devices = deviceText(config);
+                const auto selectLine = devices.selectInput == devices.selectOutput
+                    ? hbox({ muted("Select "), text(devices.selectInput) | bold | color(kBright),
+                             muted(" as input and output device") })
+                    : hbox({ muted("Select "), text(devices.selectInput) | bold | color(kBright), muted(" as input, "),
+                             text(devices.selectOutput) | bold | color(kBright), muted(" as output device") });
+
                 return panel("PluginHost link", vbox({
-                    hbox({ muted("Select "), text("StageCue Soundcard Sim") | bold | color(kBright),
-                           muted(" as input and output device") }),
-                    muted("ALSA alias stagecue_sim → " + appPcmName(config)),
+                    selectLine,
+                    muted(devices.detail),
                     substreamRow("Input", loopback.appCapture, engine.getNumInputs()),
                     substreamRow("Output", loopback.appPlayback, engine.getNumOutputs()),
                     hbox({
@@ -704,6 +760,7 @@ namespace sim
 
             EventLog log;
             bool wasRunning = false;
+            bool wasStalled = false;
             std::uint64_t lastLoopbackXruns = 0;
             std::uint64_t lastMonitorXruns = 0;
             std::string lastEngineError;
@@ -721,12 +778,15 @@ namespace sim
         SimUi ui(engine, screen);
         auto component = ui.build();
 
+        // At most one redraw tick is ever queued: if a frame takes longer than the
+        // interval, ticks are skipped instead of piling up in FTXUI's event queue.
         std::atomic<bool> ticking { true };
         std::thread ticker([&] {
             while (ticking.load())
             {
                 std::this_thread::sleep_for(kRefreshInterval);
-                screen.PostEvent(Event::Custom);
+                if (!ui.framePending.exchange(true))
+                    screen.PostEvent(Event::Custom);
             }
         });
 

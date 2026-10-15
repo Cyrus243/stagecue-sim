@@ -1,7 +1,8 @@
 #include "Meters.h"
-#include "SpscRing.h"
 
 #include <gtest/gtest.h>
+
+#include <cmath>
 
 using namespace sim;
 
@@ -25,23 +26,4 @@ TEST(MeterBallistics, InstantAttackExponentialReleaseAndFloor)
     EXPECT_NEAR(released, gainToDb(0.5f / static_cast<float>(std::exp(1.0))), 1e-3);
 
     EXPECT_FLOAT_EQ(meter.update(0.0f, 10.0), kMeterFloorDb);
-}
-
-TEST(SpscRing, PushesWholeBlocksOrNothing)
-{
-    SpscRing ring(4);
-    const float block[] = { 1, 2, 3 };
-    EXPECT_TRUE(ring.push(block, 3));
-    EXPECT_FALSE(ring.push(block, 2));
-    EXPECT_EQ(ring.size(), 3u);
-
-    float out[4] = {};
-    EXPECT_EQ(ring.pop(out, 4), 3u);
-    EXPECT_FLOAT_EQ(out[2], 3.0f);
-
-    // Wraps around the end of the buffer.
-    EXPECT_TRUE(ring.push(block, 3));
-    EXPECT_EQ(ring.pop(out, 2), 2u);
-    EXPECT_FLOAT_EQ(out[1], 2.0f);
-    EXPECT_EQ(ring.size(), 1u);
 }

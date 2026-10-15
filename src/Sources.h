@@ -56,19 +56,23 @@ namespace sim
         std::atomic<float> levelDb;
     };
 
-    /** A mono (mixed-down) audio file, resampled once to the device rate. It has no
+    /** A mono (mixed-down) audio file, decoded once at the device rate. It has no
         playhead of its own: it plays at the transport's song position, and is
         silent while stopped or past its end (until the song loops). */
     class FileSource final : public ISource
     {
     public:
-        /** Decodes WAV/AIFF/FLAC (dr_libs). Returns nullptr and sets `error` on failure. */
+        /** Files are held in memory (4 bytes per frame), so their length is capped. */
+        static constexpr double kMaxFileSeconds = 20.0 * 60.0;
+
+        /** Decodes WAV/FLAC/MP3 (miniaudio), mixed to mono and resampled to targetRate.
+            Returns nullptr and sets `error` on failure. Slow for long files: call it
+            off the UI thread. */
         static std::shared_ptr<FileSource> load(const std::string& path, double targetRate,
                                                 float levelDb, std::string& error);
 
-        /** Builds a source from already-decoded mono samples (resampling if needed). */
-        static std::shared_ptr<FileSource> fromSamples(std::vector<float> mono, double sourceRate,
-                                                       double targetRate, float levelDb,
+        /** Builds a source from mono samples already at the device rate. */
+        static std::shared_ptr<FileSource> fromSamples(std::vector<float> mono, float levelDb,
                                                        std::string name = "buffer");
 
         void render(float* out, int numFrames, const TransportFrame& transport) noexcept override;
