@@ -30,8 +30,13 @@ namespace sim
         unsigned periods = 4;
         bool headless = false;           // --headless: no TUI, periodic status lines
         std::string cardId = "StageCueSim";                 // Linux: snd-aloop card id
-        std::string inputsDevice = "StageCue Sim Inputs";   // macOS: sim -> PluginHost loopback device
-        std::string outputsDevice = "StageCue Sim Outputs"; // macOS: PluginHost -> sim loopback device
+        // macOS: the sim plays its inputs into inputsDevice and reads PluginHost's outputs from
+        // outputsDevice; PluginHost opens hostDevice for both. The patched loopback driver
+        // crosses the two ends, so PluginHost gets one device (two would go through JUCE's
+        // device combiner, which underruns on zero-latency loopback devices).
+        std::string inputsDevice = "StageCue Soundcard Sim (sim side)";
+        std::string outputsDevice = "StageCue Soundcard Sim (sim side)";
+        std::string hostDevice = "StageCue Soundcard Sim";
         std::string monitorDevice = "default";
         bool startPlaying = false;       // --play: start the song transport right away
         std::vector<SourceSpec> sources;

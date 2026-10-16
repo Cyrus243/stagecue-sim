@@ -17,7 +17,7 @@ frontend → backend → audio path can be tested without real hardware.
   from the CoreAudio HAL on macOS 14+).
 
 Runs on Linux, using the kernel's ALSA loopback driver (`snd-aloop`), and on
-macOS, using two CoreAudio loopback devices built from
+macOS, using a CoreAudio loopback driver built from a patched
 [BlackHole](https://github.com/ExistentialAudio/BlackHole) (see [macOS](#macos)).
 Audio I/O, decoding and resampling come from [miniaudio](https://miniaud.io),
 so almost all of the code is the same on both platforms.
@@ -99,22 +99,30 @@ macOS (needs Xcode, which builds the driver):
 ## macOS
 
 There is no kernel loopback on macOS, so `setup-loopback.sh` builds BlackHole
-v0.7.2 from source twice and installs it into `/Library/Audio/Plug-Ins/HAL`:
+v0.7.2 from source with `patches/blackhole-crossed-loopback.patch` and installs
+it into `/Library/Audio/Plug-Ins/HAL`. The driver has two devices, crossed like
+the two ends of `snd-aloop`:
 
 ```
- sources ──► "StageCue Sim Inputs"  (32 ch) ──► PluginHost input device
- meters  ◄── "StageCue Sim Outputs" (32 ch) ◄── PluginHost output device
+             sim side                                  PluginHost side
+ sources ──► "StageCue Soundcard Sim (sim side)" out ═► in  ┐
+                                                            ├─ "StageCue Soundcard Sim" (32 ch)
+ meters  ◄── "StageCue Soundcard Sim (sim side)" in  ◄═ out ┘
    └──► main out (system default output, or --monitor NAME)
 ```
 
-Each BlackHole device loops its own output back to its input. That's why there
-are two: with one, the sim's signals and PluginHost's would be mixed together.
-Neither device can become the system default, so macOS never routes other
-sounds through them.
+Both devices share one clock. Neither can become the system default, so macOS
+never routes other sounds through them.
 
-- In PluginHost, select **StageCue Sim Inputs** as the input device and
-  **StageCue Sim Outputs** as the output device.
-- The simulator switches both devices to `--rate`. PluginHost has to run at the
+- In PluginHost, select **StageCue Soundcard Sim** as both the input and the
+  output device, as on Linux.
+- Why one device: given two different devices, JUCE bridges them with its
+  `AudioIODeviceCombiner`. Loopback devices report zero latency, so the
+  combiner's FIFO underruns all the time and the outputs glitch (small buffers)
+  or stay silent (512 and up). The earlier two-driver setup ("StageCue Sim
+  Inputs" / "StageCue Sim Outputs") had that problem; `./setup-loopback.sh`
+  replaces it.
+- The simulator switches the driver to `--rate`. PluginHost has to run at the
   same rate.
 - `--period` only sets the simulator's own buffer size. PluginHost picks its own
   buffer size on macOS.
@@ -158,8 +166,9 @@ StageCueSoundcardSim --inputs 4 --outputs 2 \
 | `--rate HZ` | 48000 | |
 | `--period FRAMES` | 512 | PluginHost's buffer size follows it |
 | `--card ID` | StageCueSim | Linux: must match `CARD_ID` used by the setup script |
-| `--inputs-device NAME` | StageCue Sim Inputs | macOS: device the inputs are written to |
-| `--outputs-device NAME` | StageCue Sim Outputs | macOS: device the outputs are read from |
+| `--inputs-device NAME` | StageCue Soundcard Sim (sim side) | macOS: device the inputs are written to |
+| `--outputs-device NAME` | StageCue Soundcard Sim (sim side) | macOS: device the outputs are read from |
+| `--host-device NAME` | StageCue Soundcard Sim | macOS: device PluginHost opens (link status) |
 | `--monitor DEVICE` | default | main out: an ALSA PCM on Linux, a CoreAudio device name on macOS |
 | `--source SPEC` | | `N=silence`, `N=sine[:HZ[:DB]]`, `N=file:PATH[:DB]` |
 | `--play` | off | start the song transport playing |
@@ -187,8 +196,8 @@ StageCueSoundcardSim --headless --source 1=sine:1000:-12 --play
 ```
 
 On macOS you can also check the loopback without PluginHost: pass
-`--outputs-device "StageCue Sim Inputs"` and the outputs read back what the
-inputs play (peak out = peak in).
+`--outputs-device "StageCue Soundcard Sim"` (PluginHost's end) and the outputs
+read back what the inputs play (peak out = peak in).
 
 Keys: Tab / arrows move between controls, ←/→ adjust sliders and toggles, Enter
 loads a file path, Esc or Ctrl+C quits.
@@ -197,9 +206,8 @@ loads a file path, Esc or Ctrl+C quits.
 
 1. `./setup-loopback.sh`, then start the simulator.
 2. Start PluginHost. In the frontend's audio settings, select
-   **StageCue Soundcard Sim** as both input and output device (on macOS:
-   **StageCue Sim Inputs** as input, **StageCue Sim Outputs** as output). The
-   PluginHost link panel should show Input and Output as CONNECTED.
+   **StageCue Soundcard Sim** as both input and output device (Linux and
+   macOS). The PluginHost link panel should show Input and Output as CONNECTED.
 3. Set In 1 to a 1 kHz sine at −12 dB. PluginHost's `channelsLevels` meter
    for the channel fed by hardware input 1 should read about −12 dB.
 4. Route that channel to the main bus. Out 1/2 in the simulator should light

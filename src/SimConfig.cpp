@@ -16,8 +16,9 @@ namespace sim
             "  --rate HZ           sample rate                                   [48000]\n"
             "  --period FRAMES     period size; PluginHost's buffer size follows [512]\n"
 #if defined(__APPLE__)
-            "  --inputs-device N   loopback device for the inputs  [StageCue Sim Inputs]\n"
-            "  --outputs-device N  loopback device for the outputs [StageCue Sim Outputs]\n"
+            "  --inputs-device N   device the inputs are played into [StageCue Soundcard Sim (sim side)]\n"
+            "  --outputs-device N  device the outputs are read from  [StageCue Soundcard Sim (sim side)]\n"
+            "  --host-device N     device PluginHost opens (link status) [StageCue Soundcard Sim]\n"
             "  --monitor NAME      CoreAudio device for the main out             [default]\n"
 #else
             "  --card ID           snd-aloop card id                             [StageCueSim]\n"
@@ -64,12 +65,12 @@ namespace sim
     DeviceText deviceText(const SimConfig& config)
     {
         return {
-            config.inputsDevice + " / " + config.outputsDevice,
-            config.inputsDevice,
-            config.outputsDevice,
-            "CoreAudio loopback devices (BlackHole)",
-            "Loopback devices not found - run ./setup-loopback.sh (installs \"" + config.inputsDevice
-                + "\" and \"" + config.outputsDevice + "\")",
+            config.hostDevice,
+            config.hostDevice,
+            config.hostDevice,
+            "CoreAudio loopback (patched BlackHole); the sim uses \"" + config.inputsDevice + "\"",
+            "Loopback device not found - run ./setup-loopback.sh (installs \"" + config.hostDevice
+                + "\" and \"" + config.inputsDevice + "\")",
         };
     }
 #else
@@ -213,6 +214,10 @@ namespace sim
             else if (arg == "--outputs-device")
             {
                 config.outputsDevice = value;
+            }
+            else if (arg == "--host-device")
+            {
+                config.hostDevice = value;
             }
 #else
             else if (arg == "--card")

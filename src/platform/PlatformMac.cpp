@@ -56,24 +56,27 @@ namespace sim::platform
             return {};
         }
 
-        /** Finds which processes run IO on the two loopback devices (macOS 14+).
-            Device IDs are looked up by name once and kept while they stay valid,
-            so a poll costs one process-list read plus a few property reads. */
+        /** Finds whether another process (PluginHost) runs input and/or output on the
+            device it is meant to open (macOS 14+). Device IDs are looked up by name once
+            and kept while they stay valid, so a poll costs one process-list read plus a
+            few property reads. */
         class HalLinkProbe final : public LinkProbe
         {
         public:
             explicit HalLinkProbe(const SimConfig& config)
-                : inputsName(config.inputsDevice), outputsName(config.outputsDevice)
+                : simInputsName(config.inputsDevice), simOutputsName(config.outputsDevice),
+                  hostName(config.hostDevice)
             {
             }
 
             LoopbackStatus query() override
             {
-                refresh(inputs, inputsName, Scope::Input);
-                refresh(outputs, outputsName, Scope::Output);
+                refresh(simInputs, simInputsName, Scope::Output);
+                refresh(simOutputs, simOutputsName, Scope::Input);
+                refresh(host, hostName, Scope::Input);
 
                 LoopbackStatus result;
-                result.cardPresent = inputs && outputs;
+                result.cardPresent = simInputs && simOutputs && host;
                 if (!result.cardPresent)
                     return result;
 
@@ -100,8 +103,8 @@ namespace sim::platform
                     }
                 }
 
-                result.appCapture = substream(*inputs, capturing);
-                result.appPlayback = substream(*outputs, playing);
+                result.appCapture = substream(*host, capturing);
+                result.appPlayback = substream(*host, playing);
                 return result;
             }
 
@@ -125,10 +128,12 @@ namespace sim::platform
                 return status;
             }
 
-            std::string inputsName;
-            std::string outputsName;
-            std::optional<AudioObjectID> inputs;
-            std::optional<AudioObjectID> outputs;
+            std::string simInputsName;
+            std::string simOutputsName;
+            std::string hostName;
+            std::optional<AudioObjectID> simInputs;
+            std::optional<AudioObjectID> simOutputs;
+            std::optional<AudioObjectID> host;
         };
     }
 
@@ -147,7 +152,15 @@ namespace sim::platform
         if (auto error = prepareDevice(config.inputsDevice, Scope::Output, config.numInputs, config.sampleRate);
             !error.empty())
             return error;
-        return prepareDevice(config.outputsDevice, Scope::Input, config.numOutputs, config.sampleRate);
+        if (auto error = prepareDevice(config.outputsDevice, Scope::Input, config.numOutputs, config.sampleRate);
+            !error.empty())
+            return error;
+        // PluginHost's end: has to exist and run at the same rate (the patched driver
+        // shares one rate between its two devices, so this is normally already true).
+        if (auto error = prepareDevice(config.hostDevice, Scope::Input, config.numInputs, config.sampleRate);
+            !error.empty())
+            return error;
+        return prepareDevice(config.hostDevice, Scope::Output, config.numOutputs, config.sampleRate);
     }
 
     std::unique_ptr<LinkProbe> makeLinkProbe(const SimConfig& config) { return std::make_unique<HalLinkProbe>(config); }

@@ -31,12 +31,14 @@ TEST(SimConfig, DefaultsMatchPluginHostDeviceDefaults)
 TEST(SimConfig, ParsesIoCountsAndDevices)
 {
     const auto result = parse({ "--inputs", "4", "--outputs", "2", "--inputs-device", "BlackHole 16ch",
-                                "--outputs-device", "BlackHole 2ch", "--monitor", "MacBook Pro Speakers" });
+                                "--outputs-device", "BlackHole 2ch", "--host-device", "BlackHole 64ch",
+                                "--monitor", "MacBook Pro Speakers" });
     ASSERT_TRUE(result.config);
     EXPECT_EQ(result.config->numInputs, 4);
     EXPECT_EQ(result.config->numOutputs, 2);
     EXPECT_EQ(result.config->inputsDevice, "BlackHole 16ch");
     EXPECT_EQ(result.config->outputsDevice, "BlackHole 2ch");
+    EXPECT_EQ(result.config->hostDevice, "BlackHole 64ch");
     EXPECT_EQ(result.config->monitorDevice, "MacBook Pro Speakers");
 }
 
@@ -44,8 +46,11 @@ TEST(SimConfig, DefaultsToTheStageCueLoopbackDevices)
 {
     const auto result = parse({});
     ASSERT_TRUE(result.config);
-    EXPECT_EQ(result.config->inputsDevice, "StageCue Sim Inputs");
-    EXPECT_EQ(result.config->outputsDevice, "StageCue Sim Outputs");
+    // One crossed loopback driver: the sim uses its "sim side" device for both directions,
+    // PluginHost a single device for input and output.
+    EXPECT_EQ(result.config->inputsDevice, "StageCue Soundcard Sim (sim side)");
+    EXPECT_EQ(result.config->outputsDevice, "StageCue Soundcard Sim (sim side)");
+    EXPECT_EQ(result.config->hostDevice, "StageCue Soundcard Sim");
     EXPECT_FALSE(parse({ "--card", "Foo" }).config);
 }
 #else

@@ -4,9 +4,10 @@
 # Linux: loads the ALSA loopback card (snd-aloop), registers a user-level ALSA alias
 # so PluginHost lists it as "StageCue Soundcard Sim", and tells WirePlumber to leave
 # the card alone.
-# macOS: builds BlackHole (CoreAudio loopback driver) from source twice, as
-# "StageCue Sim Inputs" (sim -> PluginHost) and "StageCue Sim Outputs" (PluginHost -> sim),
-# and installs both into /Library/Audio/Plug-Ins/HAL. Needs Xcode.
+# macOS: builds BlackHole (CoreAudio loopback driver) from source with a patch that
+# crosses its two devices like snd-aloop: "StageCue Soundcard Sim" (PluginHost's side,
+# one device for input and output) and "StageCue Soundcard Sim (sim side)". Installs it
+# into /Library/Audio/Plug-Ins/HAL. Needs Xcode.
 #
 #   ./setup-loopback.sh            set up (asks for sudo)
 #   ./setup-loopback.sh --persist  same, and load the card at every boot (macOS: always the case)
@@ -166,20 +167,34 @@ status() {
 }
 
 # ---------------------------------------------------------------------------
-# macOS: two renamed BlackHole drivers
+# macOS: one patched BlackHole driver with two crossed devices
 # ---------------------------------------------------------------------------
+#
+# PluginHost must open a single device for input and output: given two devices, JUCE
+# bridges them with its AudioIODeviceCombiner, which underruns constantly on loopback
+# devices (they report zero latency), so the outputs glitch or stay silent. The patch
+# gives BlackHole's main device and its mirror (Device2) separate ring buffers, crossed:
+#
+#   sim side:   "StageCue Soundcard Sim (sim side)"   out -> ring A   in <- ring B
+#   PluginHost: "StageCue Soundcard Sim"              in  <- ring A   out -> ring B
+#
+# Both devices share the driver's clock, so nothing drifts.
 
 BLACKHOLE_REPO=https://github.com/ExistentialAudio/BlackHole.git
 BLACKHOLE_TAG=v0.7.2
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BLACKHOLE_PATCH="${SCRIPT_DIR}/patches/blackhole-crossed-loopback.patch"
 HAL_DIR=/Library/Audio/Plug-Ins/HAL
 CACHE_DIR="${HOME}/Library/Caches/StageCueSoundcardSim"
 
-# name | bundle | bundle id | CFPlugIn factory UUID (fixed, so each driver loads on its own).
-# The names must match SimConfig's inputsDevice / outputsDevice defaults.
-MAC_DRIVERS=(
-    "StageCue Sim Inputs|StageCueSimInputs|org.indelible.stagecue.sim.inputs|DE527BE5-9C69-4B0F-BA4F-B27CA3CFAD95"
-    "StageCue Sim Outputs|StageCueSimOutputs|org.indelible.stagecue.sim.outputs|AB4E64F1-E7BF-4B29-9850-73E8DD97CAE1"
-)
+# Must match SimConfig's hostDevice / inputsDevice / outputsDevice defaults.
+MAC_HOST_DEVICE="StageCue Soundcard Sim"
+MAC_SIM_DEVICE="StageCue Soundcard Sim (sim side)"
+MAC_BUNDLE=StageCueSoundcardSim
+MAC_BUNDLE_ID=org.indelible.stagecue.sim
+MAC_FACTORY_UUID=817FC046-EE6B-43AD-BA8D-C92678821D22   # fixed, so the driver loads on its own
+# The earlier two-driver setup; removed on install and --remove.
+MAC_LEGACY_BUNDLES=(StageCueSimInputs StageCueSimOutputs)
 
 mac_device_listed() { system_profiler SPAudioDataType 2>/dev/null | grep -qF "$1:"; }
 
@@ -188,35 +203,62 @@ mac_restart_coreaudio() {
     sudo killall coreaudiod 2>/dev/null || true
 }
 
-mac_build_driver() {
-    local name="$1" bundle="$2" bundle_id="$3" uuid="$4" src="$5" out="$6"
-    local escaped_name="${name// /\\ }"
+# Clones BlackHole once and applies the crossed-loopback patch (idempotent).
+mac_fetch_source() {
+    local src="$1"
+    if [[ ! -d "$src" ]]; then
+        info "fetching BlackHole ${BLACKHOLE_TAG}"
+        mkdir -p "$CACHE_DIR"
+        git clone --quiet --depth 1 --branch "$BLACKHOLE_TAG" "$BLACKHOLE_REPO" "$src" 2>/dev/null \
+            || die "could not clone ${BLACKHOLE_REPO}"
+    fi
+    if git -C "$src" apply --reverse --check "$BLACKHOLE_PATCH" 2>/dev/null; then
+        return 0   # already patched
+    fi
+    git -C "$src" apply "$BLACKHOLE_PATCH" || die "could not apply ${BLACKHOLE_PATCH} to ${src} (delete it and retry)"
+}
 
-    info "building ${name}"
+mac_build_driver() {
+    local src="$1" out="$2"
+    local host_name="${MAC_HOST_DEVICE// /\\ }" sim_name="${MAC_SIM_DEVICE// /\\ }"
+
+    info "building ${MAC_HOST_DEVICE}"
     xcodebuild -quiet \
         -project "${src}/BlackHole.xcodeproj" -configuration Release -target BlackHole \
         CONFIGURATION_BUILD_DIR="${out}" SYMROOT="${out}/sym" OBJROOT="${out}/obj" \
-        PRODUCT_BUNDLE_IDENTIFIER="${bundle_id}" \
+        PRODUCT_BUNDLE_IDENTIFIER="${MAC_BUNDLE_ID}" \
         CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
-        GCC_PREPROCESSOR_DEFINITIONS="\$GCC_PREPROCESSOR_DEFINITIONS kNumber_Of_Channels=32 kHas_Driver_Name_Format=false kDriver_Name=\\\"${bundle}\\\" kDevice_Name=\\\"${escaped_name}\\\" kPlugIn_BundleID=\\\"${bundle_id}\\\" kManufacturer_Name=\\\"StageCue\\\" kCanBeDefaultDevice=false kCanBeDefaultSystemDevice=false kEnableVolumeControl=false" \
-        >/dev/null || die "building ${name} failed (run with a working Xcode: xcode-select -p)"
+        GCC_PREPROCESSOR_DEFINITIONS="\$GCC_PREPROCESSOR_DEFINITIONS kNumber_Of_Channels=32 kHas_Driver_Name_Format=false kDriver_Name=\\\"${MAC_BUNDLE}\\\" kDevice_Name=\\\"${host_name}\\\" kDevice2_Name=\\\"${sim_name}\\\" kDevice2_IsHidden=false kPlugIn_BundleID=\\\"${MAC_BUNDLE_ID}\\\" kManufacturer_Name=\\\"StageCue\\\" kCanBeDefaultDevice=false kCanBeDefaultSystemDevice=false kEnableVolumeControl=false" \
+        >/dev/null || die "building ${MAC_HOST_DEVICE} failed (run with a working Xcode: xcode-select -p)"
 
     local plist="${out}/BlackHole.driver/Contents/Info.plist"
-    sed -i '' "s/e395c745-4eea-4d94-bb92-46224221047c/${uuid}/g" "$plist"
-    rm -rf "${out}/${bundle}.driver"
-    mv "${out}/BlackHole.driver" "${out}/${bundle}.driver"
-    codesign --force --deep --sign - "${out}/${bundle}.driver" >/dev/null 2>&1 \
-        || die "ad-hoc signing ${bundle}.driver failed"
+    sed -i '' "s/e395c745-4eea-4d94-bb92-46224221047c/${MAC_FACTORY_UUID}/g" "$plist"
+    rm -rf "${out}/${MAC_BUNDLE}.driver"
+    mv "${out}/BlackHole.driver" "${out}/${MAC_BUNDLE}.driver"
+    codesign --force --deep --sign - "${out}/${MAC_BUNDLE}.driver" >/dev/null 2>&1 \
+        || die "ad-hoc signing ${MAC_BUNDLE}.driver failed"
+}
+
+# Removes the earlier two-driver setup. Returns 0 if anything was removed.
+mac_remove_legacy() {
+    local removed=1 bundle
+    for bundle in "${MAC_LEGACY_BUNDLES[@]}"; do
+        if [[ -d "${HAL_DIR}/${bundle}.driver" ]]; then
+            info "removing the old ${HAL_DIR}/${bundle}.driver"
+            sudo rm -rf "${HAL_DIR}/${bundle}.driver"
+            removed=0
+        fi
+    done
+    return $removed
 }
 
 mac_install() {
-    local missing=0 entry name bundle bundle_id uuid
-    for entry in "${MAC_DRIVERS[@]}"; do
-        IFS='|' read -r name bundle bundle_id uuid <<<"$entry"
-        [[ -d "${HAL_DIR}/${bundle}.driver" ]] || missing=1
+    local has_legacy=0 bundle
+    for bundle in "${MAC_LEGACY_BUNDLES[@]}"; do
+        [[ -d "${HAL_DIR}/${bundle}.driver" ]] && has_legacy=1
     done
-    if [[ $missing -eq 0 ]]; then
-        info "loopback devices already installed (--remove first to rebuild)"
+    if [[ -d "${HAL_DIR}/${MAC_BUNDLE}.driver" && $has_legacy -eq 0 ]]; then
+        info "loopback device already installed (--remove first to rebuild)"
         return 0
     fi
 
@@ -224,31 +266,20 @@ mac_install() {
         || die "Xcode is required to build the loopback driver (install it from the App Store, then: sudo xcode-select -s /Applications/Xcode.app)"
 
     local src="${CACHE_DIR}/BlackHole-${BLACKHOLE_TAG}" out="${CACHE_DIR}/build"
-    if [[ ! -d "$src" ]]; then
-        info "fetching BlackHole ${BLACKHOLE_TAG}"
-        mkdir -p "$CACHE_DIR"
-        git clone --quiet --depth 1 --branch "$BLACKHOLE_TAG" "$BLACKHOLE_REPO" "$src" 2>/dev/null \
-            || die "could not clone ${BLACKHOLE_REPO}"
-    fi
+    mac_fetch_source "$src"
     mkdir -p "$out"
-
-    for entry in "${MAC_DRIVERS[@]}"; do
-        IFS='|' read -r name bundle bundle_id uuid <<<"$entry"
-        mac_build_driver "$name" "$bundle" "$bundle_id" "$uuid" "$src" "$out"
-    done
+    mac_build_driver "$src" "$out"
 
     info "installing into ${HAL_DIR} - sudo may ask for your password"
     sudo mkdir -p "$HAL_DIR"
-    for entry in "${MAC_DRIVERS[@]}"; do
-        IFS='|' read -r name bundle bundle_id uuid <<<"$entry"
-        sudo rm -rf "${HAL_DIR}/${bundle}.driver"
-        sudo cp -R "${out}/${bundle}.driver" "${HAL_DIR}/"
-        sudo chown -R root:wheel "${HAL_DIR}/${bundle}.driver"
-    done
+    mac_remove_legacy || true
+    sudo rm -rf "${HAL_DIR}/${MAC_BUNDLE}.driver"
+    sudo cp -R "${out}/${MAC_BUNDLE}.driver" "${HAL_DIR}/"
+    sudo chown -R root:wheel "${HAL_DIR}/${MAC_BUNDLE}.driver"
     mac_restart_coreaudio
 
-    for entry in "${MAC_DRIVERS[@]}"; do
-        IFS='|' read -r name bundle bundle_id uuid <<<"$entry"
+    local name
+    for name in "$MAC_HOST_DEVICE" "$MAC_SIM_DEVICE"; do
         for _ in $(seq 1 20); do
             mac_device_listed "$name" && break
             sleep 0.5
@@ -262,29 +293,32 @@ Temporarily move the suspect one out of ${HAL_DIR}, run 'sudo killall coreaudiod
 }
 
 mac_remove() {
-    local removed=0 entry name bundle bundle_id uuid
-    for entry in "${MAC_DRIVERS[@]}"; do
-        IFS='|' read -r name bundle bundle_id uuid <<<"$entry"
-        if [[ -d "${HAL_DIR}/${bundle}.driver" ]]; then
-            info "removing ${HAL_DIR}/${bundle}.driver"
-            sudo rm -rf "${HAL_DIR}/${bundle}.driver"
-            removed=1
-        fi
-    done
+    local removed=0
+    if [[ -d "${HAL_DIR}/${MAC_BUNDLE}.driver" ]]; then
+        info "removing ${HAL_DIR}/${MAC_BUNDLE}.driver"
+        sudo rm -rf "${HAL_DIR}/${MAC_BUNDLE}.driver"
+        removed=1
+    fi
+    mac_remove_legacy && removed=1
     [[ $removed -eq 1 ]] && mac_restart_coreaudio
     rm -rf "${CACHE_DIR}/build"
-    info "loopback devices removed"
+    info "loopback device removed"
 }
 
 mac_status() {
-    local entry name bundle bundle_id uuid
-    for entry in "${MAC_DRIVERS[@]}"; do
-        IFS='|' read -r name bundle bundle_id uuid <<<"$entry"
-        local installed="not installed" listed="not listed"
-        [[ -d "${HAL_DIR}/${bundle}.driver" ]] && installed="installed (${HAL_DIR}/${bundle}.driver)"
+    local installed="not installed" name bundle
+    [[ -d "${HAL_DIR}/${MAC_BUNDLE}.driver" ]] && installed="installed (${HAL_DIR}/${MAC_BUNDLE}.driver)"
+    printf '%-35s %s\n' "driver:" "$installed"
+    for name in "$MAC_HOST_DEVICE" "$MAC_SIM_DEVICE"; do
+        local listed="not listed"
         mac_device_listed "$name" && listed="listed by CoreAudio"
-        printf '%-21s %s, %s\n' "${name}:" "$installed" "$listed"
+        printf '%-35s %s\n' "${name}:" "$listed"
     done
+    for bundle in "${MAC_LEGACY_BUNDLES[@]}"; do
+        [[ -d "${HAL_DIR}/${bundle}.driver" ]] \
+            && printf '%-35s %s\n' "old ${bundle}.driver:" "still installed (run $0 to replace it)"
+    done
+    return 0
 }
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -293,7 +327,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
         --persist) mac_install; info "HAL drivers load at every boot; nothing else to do" ;;
         --remove)  mac_remove ;;
         --status)  mac_status ;;
-        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
         *)         die "unknown option: $1 (see --help)" ;;
     esac
     exit 0
@@ -304,6 +338,6 @@ case "${1:-}" in
     --persist) load_module; install_alias; install_wireplumber_rule; persist ;;
     --remove)  remove_all ;;
     --status)  status ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
     *)         die "unknown option: $1 (see --help)" ;;
 esac
