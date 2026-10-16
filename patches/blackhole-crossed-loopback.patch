@@ -1,0 +1,98 @@
+diff --git a/BlackHole/BlackHole.c b/BlackHole/BlackHole.c
+index 143af9d..f8711f4 100644
+--- a/BlackHole/BlackHole.c
++++ b/BlackHole/BlackHole.c
+@@ -338,6 +338,9 @@ static const UInt32                 kDevice_SampleRatesSize             = sizeof
+ #define                             kBytes_Per_Frame                    (kNumber_Of_Channels * kBytes_Per_Channel)
+ #define                             kRing_Buffer_Frame_Size             ((65536 + kLatency_Frame_Size))
+ static Float32*                     gRingBuffer = NULL;
++// StageCue crossed loopback: the main device writes into gRingBuffer2 and reads gRingBuffer;
++// Device2 (the mirror) does the reverse. Both share one clock, like the two ends of snd-aloop.
++static Float32*                     gRingBuffer2 = NULL;
+ 
+ 
+ //==================================================================================================
+@@ -4342,6 +4345,7 @@ static OSStatus	BlackHole_StartIO(AudioServerPlugInDriverRef inDriver, AudioObje
+         gDevice_AnchorHostTime = mach_absolute_time();
+         gDevice_PreviousTicks = 0;
+         gRingBuffer = calloc(kRing_Buffer_Frame_Size * kNumber_Of_Channels, sizeof(Float32));
++        gRingBuffer2 = calloc(kRing_Buffer_Frame_Size * kNumber_Of_Channels, sizeof(Float32));
+     }
+     
+     
+@@ -4380,6 +4384,8 @@ static OSStatus	BlackHole_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjec
+     {
+         free(gRingBuffer);
+         gRingBuffer = NULL;
++        free(gRingBuffer2);
++        gRingBuffer2 = NULL;
+     }
+ 	
+ 	//	unlock the state lock
+@@ -4546,31 +4552,40 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
+         secondPartFrameSize = inIOBufferFrameSize - firstPartFrameSize;
+     }
+     
+-    // Keep track of last outputSampleTime and the cleared buffer status.
+-    static Float64 lastOutputSampleTime = 0;
+-    static Boolean isBufferClear = true;
++    // Keep track of last outputSampleTime and the cleared buffer status, per ring.
++    static Float64 lastOutputSampleTimes[2] = { 0, 0 };
++    static Boolean isBufferClears[2] = { true, true };
++
++    // Crossed loopback: Device reads ring 0 and writes ring 1, Device2 the other way round.
++    const Boolean isMainDevice = inDeviceObjectID == kObjectID_Device;
++    const Boolean isRead = inOperationID == kAudioServerPlugInIOOperationReadInput;
++    const int ringIndex = (isMainDevice == isRead) ? 0 : 1;
++    Float32* ringBuffer = ringIndex == 0 ? gRingBuffer : gRingBuffer2;
++    Float64* lastOutputSampleTime = &lastOutputSampleTimes[ringIndex];
++    Boolean* isBufferClear = &isBufferClears[ringIndex];
++    FailWithAction(ringBuffer == NULL, theAnswer = kAudioHardwareNotRunningError, Done, "BlackHole_DoIOOperation: IO not running");
+     
+     // From BlackHole to Application
+     if(inOperationID == kAudioServerPlugInIOOperationReadInput)
+     {
+         // If mute is one let's just fill the buffer with zeros or if there's no apps outputting audio
+-        if (gMute_Master_Value || lastOutputSampleTime - inIOBufferFrameSize < inIOCycleInfo->mInputTime.mSampleTime)
++        if (gMute_Master_Value || *lastOutputSampleTime - inIOBufferFrameSize < inIOCycleInfo->mInputTime.mSampleTime)
+         {
+             // Clear the ioMainBuffer
+             vDSP_vclr(ioMainBuffer, 1, inIOBufferFrameSize * kNumber_Of_Channels);
+             
+             // Clear the ring buffer.
+-            if (!isBufferClear)
++            if (!*isBufferClear)
+             {
+-                vDSP_vclr(gRingBuffer, 1, kRing_Buffer_Frame_Size * kNumber_Of_Channels);
+-                isBufferClear = true;
++                vDSP_vclr(ringBuffer, 1, kRing_Buffer_Frame_Size * kNumber_Of_Channels);
++                *isBufferClear = true;
+             }
+         }
+         else
+         {
+             // Copy the buffers.
+-            memcpy(ioMainBuffer, gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
+-            memcpy((Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, gRingBuffer, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
++            memcpy(ioMainBuffer, ringBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
++            memcpy((Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, ringBuffer, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
+             
+             // Finally we'll apply the output volume to the buffer.
+ 	    if(kEnableVolumeControl)
+@@ -4595,12 +4610,12 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
+         // Issue with outputting from mirrored device and main device at the same time. Not currently mixing. 
+         
+         // Copy the buffers.
+-        memcpy(gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, ioMainBuffer, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
+-        memcpy(gRingBuffer, (Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
++        memcpy(ringBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, ioMainBuffer, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
++        memcpy(ringBuffer, (Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
+         
+         // Save the last output time.
+-        lastOutputSampleTime = inIOCycleInfo->mOutputTime.mSampleTime + inIOBufferFrameSize;
+-        isBufferClear = false;
++        *lastOutputSampleTime = inIOCycleInfo->mOutputTime.mSampleTime + inIOBufferFrameSize;
++        *isBufferClear = false;
+     }
+ 
+ Done:
