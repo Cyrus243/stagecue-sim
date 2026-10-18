@@ -2,12 +2,16 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace sim
 {
+    /** Expands a leading "~/" and makes the path absolute (left as is if that fails). */
+    [[nodiscard]] std::filesystem::path resolvePath(const std::string& path);
+
     /** The shared song position for one period. Every input renders the same
         period with the same frame, which keeps file sources sample-aligned. */
     struct TransportFrame
@@ -67,9 +71,10 @@ namespace sim
 
         /** Decodes WAV/FLAC/MP3 (miniaudio), mixed to mono and resampled to targetRate.
             Returns nullptr and sets `error` on failure. Slow for long files: call it
-            off the UI thread. */
+            off the UI thread. Setting `cancel` stops the decode (error "cancelled"). */
         static std::shared_ptr<FileSource> load(const std::string& path, double targetRate,
-                                                float levelDb, std::string& error);
+                                                float levelDb, std::string& error,
+                                                const std::atomic<bool>* cancel = nullptr);
 
         /** Builds a source from mono samples already at the device rate. */
         static std::shared_ptr<FileSource> fromSamples(std::vector<float> mono, float levelDb,

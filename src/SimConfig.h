@@ -61,6 +61,9 @@ namespace sim
     /** Parses `index=kind[:args]` (1-based index), e.g. `2=file:/tmp/kick.wav:-6`. */
     [[nodiscard]] std::optional<SourceSpec> parseSourceSpec(const std::string& text, std::string& error);
 
+    /** The inverse of parseSourceSpec: `2=sine:440:-6`, `3=file:/abs/kick.wav:-12`. */
+    [[nodiscard]] std::string formatSourceSpec(const SourceSpec& spec);
+
     struct ParseResult
     {
         std::optional<SimConfig> config;  // empty when we should exit

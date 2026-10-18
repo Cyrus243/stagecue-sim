@@ -142,3 +142,28 @@ TEST(SimConfig, RejectsSourceForMissingInput)
     EXPECT_FALSE(parse({ "--inputs", "2", "--source", "3=sine" }).config);
     EXPECT_TRUE(parse({ "--inputs", "3", "--source", "3=sine" }).config);
 }
+
+TEST(SimConfig, FormatsSourceSpecsThatParseBack)
+{
+    std::string error;
+    for (const char* text : { "1=silence", "2=sine:440:-6", "3=file:/tmp/My Stems/a:b ü.wav:-12", "4=sine:1234.5:-3.25" })
+    {
+        const auto spec = parseSourceSpec(text, error);
+        ASSERT_TRUE(spec) << error;
+        EXPECT_EQ(formatSourceSpec(*spec), text);
+    }
+}
+
+TEST(SimConfig, FormattedFileSpecAlwaysCarriesALevel)
+{
+    // A path ending in ":12" would otherwise read back as a level.
+    SourceSpec spec;
+    spec.kind = SourceSpec::Kind::File;
+    spec.filePath = "/tmp/take:12";
+    spec.levelDb = -12.0f;
+    std::string error;
+    const auto parsed = parseSourceSpec(formatSourceSpec(spec), error);
+    ASSERT_TRUE(parsed) << error;
+    EXPECT_EQ(parsed->filePath, "/tmp/take:12");
+    EXPECT_FLOAT_EQ(parsed->levelDb, -12.0f);
+}

@@ -11,20 +11,20 @@
 
 namespace sim
 {
+    std::filesystem::path resolvePath(const std::string& path)
+    {
+        std::string expanded = path;
+        if (expanded.rfind("~/", 0) == 0)
+            if (const char* home = std::getenv("HOME"))
+                expanded = std::string(home) + expanded.substr(1);
+
+        std::error_code ec;
+        const auto absolute = std::filesystem::absolute(expanded, ec);
+        return ec ? std::filesystem::path(expanded) : absolute;
+    }
+
     namespace
     {
-        std::filesystem::path resolvePath(const std::string& path)
-        {
-            std::string expanded = path;
-            if (expanded.rfind("~/", 0) == 0)
-                if (const char* home = std::getenv("HOME"))
-                    expanded = std::string(home) + expanded.substr(1);
-
-            std::error_code ec;
-            const auto absolute = std::filesystem::absolute(expanded, ec);
-            return ec ? std::filesystem::path(expanded) : absolute;
-        }
-
         std::string formatNumber(float value, int precision)
         {
             std::ostringstream stream;
@@ -75,7 +75,8 @@ namespace sim
     }
 
     std::shared_ptr<FileSource> FileSource::load(const std::string& path, double targetRate,
-                                                 float levelDb, std::string& error)
+                                                 float levelDb, std::string& error,
+                                                 const std::atomic<bool>* cancel)
     {
         const auto file = resolvePath(path);
         std::error_code ec;
@@ -103,8 +104,14 @@ namespace sim
 
         constexpr ma_uint64 kChunk = 16384;
         bool tooLong = false;
+        bool cancelled = false;
         while (true)
         {
+            if (cancel && cancel->load(std::memory_order_relaxed))
+            {
+                cancelled = true;
+                break;
+            }
             const auto offset = mono.size();
             mono.resize(offset + kChunk);
             ma_uint64 read = 0;
@@ -120,6 +127,11 @@ namespace sim
         }
         ma_decoder_uninit(&decoder);
 
+        if (cancelled)
+        {
+            error = "cancelled";
+            return nullptr;
+        }
         if (tooLong)
         {
             error = file.filename().string() + ": longer than " + std::to_string(static_cast<int>(kMaxFileSeconds / 60))

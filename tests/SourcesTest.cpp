@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -187,4 +188,20 @@ TEST(FileSource, ReportsMissingAndInvalidFiles)
     EXPECT_EQ(FileSource::load(bogus.string(), 48000.0, 0.0f, error), nullptr);
     EXPECT_FALSE(error.empty());
     std::filesystem::remove(bogus);
+}
+
+TEST(FileSource, StopsDecodingWhenCancelled)
+{
+    constexpr std::uint32_t rate = 48000;
+    const auto path = writeWav("soundcard-sim-cancel.wav", { std::vector<float>(rate, 0.25f) }, rate);
+
+    std::atomic<bool> cancelled { true };
+    std::string error;
+    EXPECT_EQ(FileSource::load(path.string(), 48000.0, 0.0f, error, &cancelled), nullptr);
+    EXPECT_EQ(error, "cancelled");
+
+    cancelled = false;
+    error.clear();
+    EXPECT_NE(FileSource::load(path.string(), 48000.0, 0.0f, error, &cancelled), nullptr) << error;
+    std::filesystem::remove(path);
 }

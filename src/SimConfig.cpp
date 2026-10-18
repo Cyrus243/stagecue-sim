@@ -1,6 +1,8 @@
 #include "SimConfig.h"
 
 #include <charconv>
+#include <cmath>
+#include <locale>
 #include <sstream>
 
 namespace sim
@@ -55,6 +57,22 @@ namespace sim
             while (std::getline(stream, part, sep))
                 parts.push_back(part);
             return parts;
+        }
+
+        /** Shortest text that reads back through parseNumber: "440", "-6", "1234.5". */
+        std::string formatNumber(float value)
+        {
+            const double rounded = std::round(static_cast<double>(value) * 100.0) / 100.0;
+            std::ostringstream stream;
+            stream.imbue(std::locale::classic());
+            stream.setf(std::ios::fixed);
+            stream.precision(2);
+            stream << (rounded == 0.0 ? 0.0 : rounded);   // no "-0"
+            auto text = stream.str();
+            text.erase(text.find_last_not_of('0') + 1);
+            if (text.back() == '.')
+                text.pop_back();
+            return text;
         }
     }
 
@@ -155,6 +173,22 @@ namespace sim
 
         error = "unknown source kind '" + kind + "' (silence|sine|file)";
         return std::nullopt;
+    }
+
+    std::string formatSourceSpec(const SourceSpec& spec)
+    {
+        const auto prefix = std::to_string(spec.input + 1) + "=";
+        switch (spec.kind)
+        {
+            case SourceSpec::Kind::Sine:
+                return prefix + "sine:" + formatNumber(spec.frequencyHz) + ":" + formatNumber(spec.levelDb);
+            case SourceSpec::Kind::File:
+                // Always write the level: a path ending in ":<number>" would otherwise read back as one.
+                return prefix + "file:" + spec.filePath + ":" + formatNumber(spec.levelDb);
+            case SourceSpec::Kind::Silence:
+                break;
+        }
+        return prefix + "silence";
     }
 
     ParseResult parseArgs(int argc, const char* const* argv)
