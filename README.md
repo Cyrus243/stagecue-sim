@@ -184,6 +184,35 @@ A file loaded during playback joins at the current song position. The
 transport starts stopped, so you can load every stem and then press Play
 (or pass `--play`). Sine sources ignore the transport.
 
+### Folders and setups
+
+The Control panel loads many stems at once and remembers them:
+
+- **Folder**: type a folder path (`~/` works) and press Enter. Its WAV/FLAC/MP3 files
+  go onto In 1, In 2, … in name order. Numbers sort by value, so `2 Snare` comes before
+  `10 Tom`, and hidden files such as macOS `._*` are skipped. Rename the files to change
+  the order. Each input keeps its level.
+- **Save as**: type a name (letters, digits, space, `-`, `_`) and press Enter to save what
+  every input plays now. Saving under an existing name replaces it.
+- **Setups**: pick a saved setup and press Enter to bring it back.
+
+A folder or setup that needs more inputs than are running adds them, up to 32, and then
+you re-select the device in Tessel. It never removes inputs. Inputs it doesn't mention
+go Off. The transport stops at 0:00, so every stem is in place before you press Play.
+
+Setups are plain text in `$XDG_CONFIG_HOME/stagecue-sim/setups/` (by default
+`~/.config/stagecue-sim/setups/`, also on macOS), one `--source` spec per line, so you
+can reorder or edit inputs in any editor:
+
+```
+# StageCue soundcard sim setup: one input per line (N=silence | N=sine:HZ:DB | N=file:PATH:DB)
+1=file:/Users/me/stems/01 Kick.wav:-12
+2=file:/Users/me/stems/02 Snare.wav:-9
+3=sine:1000:-20
+```
+
+A missing file shows an error on its own input, and the rest still load.
+
 ### Health checks
 
 The header shows **stalled** when the loopback stops calling back for over a
@@ -200,7 +229,7 @@ On macOS you can also check the loopback without PluginHost: pass
 read back what the inputs play (peak out = peak in).
 
 Keys: Tab / arrows move between controls, ←/→ adjust sliders and toggles, Enter
-loads a file path, Esc or Ctrl+C quits.
+loads a file or folder path, saves or recalls a setup, Esc or Ctrl+C quits.
 
 ## Testing with PluginHost
 
