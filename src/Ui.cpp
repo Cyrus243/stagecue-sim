@@ -4,6 +4,7 @@
 #include "LoopbackStatus.h"
 #include "Meters.h"
 #include "SimEngine.h"
+#include "SimSetup.h"
 #include "UiStyle.h"
 
 #include <ftxui/component/component.hpp>
@@ -11,9 +12,13 @@
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/terminal.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -30,7 +35,9 @@ namespace sim
 
         constexpr float kSignalThresholdDb = -60.0f;
         constexpr auto kSignalHold = std::chrono::seconds(1);
-        constexpr auto kRefreshInterval = std::chrono::milliseconds(33);   // ~30 Hz, like LevelMeterBroadcaster
+        // 20 Hz: smooth enough for meters. FTXUI repaints the whole screen every frame,
+        // so each extra frame costs the terminal emulator real work.
+        constexpr auto kRefreshInterval = std::chrono::milliseconds(50);
         constexpr int kWideLayoutColumns = 130;   // below this the metrics tiles are hidden
         constexpr int kTallLayoutRows = 40;       // below this the activity log is hidden
         constexpr std::size_t kLogLines = 6;
@@ -60,7 +67,26 @@ namespace sim
             return hz >= 1000.0f ? fixed(hz / 1000.0f, 2) + " kHz" : fixed(hz, 0) + " Hz";
         }
 
+        /** "~/.config/..." rather than the full home path, for display. */
+        std::string homeRelative(const std::filesystem::path& path)
+        {
+            const auto text = path.string();
+            const char* home = std::getenv("HOME");
+            if (home && *home && text.rfind(std::string(home) + "/", 0) == 0)
+                return "~" + text.substr(std::string(home).size());
+            return text;
+        }
+
         std::string twoDigits(int value) { return (value < 9 ? "0" : "") + std::to_string(value + 1); }
+
+        /** Result of a file decoded off the UI thread. */
+        struct LoadResult
+        {
+            std::shared_ptr<FileSource> file;
+            std::string error;
+            std::string path;               // resolved, as saved in a setup
+            std::uint64_t generation = 0;   // stale when the row has moved on since
+        };
 
         struct InputRow
         {
@@ -76,6 +102,12 @@ namespace sim
             bool statusIsError = false;
             std::shared_ptr<SineSource> sine;
             std::shared_ptr<FileSource> file;
+            std::future<LoadResult> pendingLoad;
+            std::uint64_t loadGeneration = 0;   // bumped by every new choice for this row
+            bool loadQueued = false;            // load `requestedPath` once the pending one is done
+            std::string requestedPath;          // what Enter / a folder / a setup asked for last
+            std::shared_ptr<std::atomic<bool>> loadCancel;   // stops the decode in flight
+            std::string loadedPath;             // file playing now (resolved); empty if none
             MeterBallistics meter;
             float meterDb = kMeterFloorDb;
             Component component;
@@ -120,11 +152,28 @@ namespace sim
                 auto quitButton = Button("Quit", screen.ExitLoopClosure(), secondaryButton());
                 auto playButton = Button(&playLabel, [this] { togglePlaying(); }, primaryButton());
                 auto restartButton = Button("⏮ Restart", [this] { restartSong(); }, secondaryButton());
+                InputOption folderOption = inputOption("folder of stems (Enter to load)");
+                folderOption.on_enter = [this] { loadFolder(); };
+                auto folderInput = Input(&folderPath, folderOption);
+                InputOption saveOption = inputOption("setup name (Enter to save)");
+                saveOption.on_enter = [this] { saveCurrentSetup(); };
+                auto saveInput = Input(&saveName, saveOption);
+                refreshSetups();
+                auto setupsMenuOption = MenuOption::Vertical();
+                setupsMenuOption.on_enter = [this] { recallSetup(); };
+                setupsMenuOption.entries_option.transform = [](const EntryState& state) {
+                    auto label = text((state.active ? "▸ " : "  ") + state.label);
+                    if (state.focused)
+                        return label | bgcolor(kAccent) | color(kBg) | bold;
+                    return state.active ? label | color(kBright) : label | color(kText);
+                };
+                auto setupsMenu = Menu(&setupNames, &selectedSetup, setupsMenuOption);
 
                 auto controls = Container::Vertical({
                     Container::Horizontal({ playButton, restartButton }),
                     inputsSlider, outputsSlider, muteCheckbox,
                     Container::Horizontal({ applyButton, quitButton }),
+                    folderInput, saveInput, setupsMenu,
                 });
                 auto controlView = Renderer(controls, [=, this] {
                     auto countRow = [](const std::string& label, const Component& slider, int value) {
@@ -141,6 +190,16 @@ namespace sim
                         countRow("Outputs", outputsSlider, requestedOutputs),
                         muteCheckbox->Render(),
                         hbox({ applyButton->Render(), text("  "), quitButton->Render() }),
+                        separatorLight() | color(kPanelBorder),
+                        hbox({ muted("Folder   "), folderInput->Render() | size(WIDTH, EQUAL, 30) }),
+                        hbox({ muted("Save as  "), saveInput->Render() | size(WIDTH, EQUAL, 30) }),
+                        hbox({
+                            muted("Setups   "),
+                            setupNames.empty() ? muted("none saved yet (Enter recalls)")
+                                               : setupsMenu->Render() | vscroll_indicator | frame | size(HEIGHT, LESS_THAN, 6),
+                        }),
+                        // Capped so a long path never widens the panel (and squeezes the log).
+                        muted("         " + homeRelative(setupsDirectory())) | size(WIDTH, LESS_THAN, 40),
                     }));
                 });
 
@@ -176,6 +235,11 @@ namespace sim
                 });
 
                 return CatchEvent(view, [this](const Event& event) {
+                    if (event == Event::Custom)
+                    {
+                        framePending = false;   // let the ticker post the next one
+                        return false;
+                    }
                     if (event == Event::Escape)
                     {
                         screen.Exit();
@@ -184,6 +248,16 @@ namespace sim
                     return false;
                 });
             }
+
+            /** Stops decodes in flight: the pending futures join them on destruction. */
+            ~SimUi()
+            {
+                for (auto& row : inputRows)
+                    stopDecode(*row);
+            }
+
+            /** Set when a redraw tick is queued; the ticker never queues a second one. */
+            std::atomic<bool> framePending { false };
 
         private:
             // ------------------------------------------------------------ rows
@@ -281,7 +355,11 @@ namespace sim
 
                 for (const auto& spec : engine.getConfig().sources)
                     if (spec.input == row.index && spec.kind == SourceSpec::Kind::File)
+                    {
                         row.path = spec.filePath;
+                        if (row.file)
+                            row.loadedPath = row.requestedPath = resolvePath(spec.filePath).string();
+                    }
 
                 row.appliedKind = row.kind;
             }
@@ -318,19 +396,79 @@ namespace sim
 
             // ------------------------------------------------------- actions
 
+            /** Decodes on a worker thread; finishLoad() picks the result up on a later frame. */
             void loadFile(InputRow& row)
             {
-                std::string error;
-                auto file = FileSource::load(row.path, engine.getConfig().sampleRate, row.levelDb, error);
-                if (!file)
+                ++row.loadGeneration;
+                row.requestedPath = resolvePath(row.path).string();
+                row.statusIsError = false;
+                // Never assign over a pending std::async future: its destructor would block the
+                // UI until that decode ends. Queue instead; finishLoad() starts it.
+                if (row.pendingLoad.valid())
                 {
-                    row.status = error;
+                    stopDecode(row);
+                    row.loadQueued = true;
+                    row.status = "queued " + row.path;
+                    return;
+                }
+                startLoad(row);
+            }
+
+            void startLoad(InputRow& row)
+            {
+                row.loadQueued = false;
+                row.status = "loading " + row.requestedPath + " ...";
+                row.loadCancel = std::make_shared<std::atomic<bool>>(false);
+                row.pendingLoad = std::async(std::launch::async,
+                                             [path = row.requestedPath, rate = engine.getConfig().sampleRate,
+                                              level = row.levelDb, generation = row.loadGeneration,
+                                              cancel = row.loadCancel] {
+                                                 LoadResult result;
+                                                 result.path = path;
+                                                 result.generation = generation;
+                                                 result.file = FileSource::load(path, rate, level, result.error, cancel.get());
+                                                 return result;
+                                             });
+            }
+
+            /** Asks the decode in flight (if any) to stop early; its result is dropped anyway. */
+            static void stopDecode(InputRow& row)
+            {
+                if (row.loadCancel)
+                    row.loadCancel->store(true);
+            }
+
+            /** Drops any load in flight for the row: its result will be ignored. */
+            void cancelLoad(InputRow& row)
+            {
+                ++row.loadGeneration;
+                row.loadQueued = false;
+                row.requestedPath.clear();
+                stopDecode(row);
+            }
+
+            void finishLoad(InputRow& row)
+            {
+                if (!row.pendingLoad.valid()
+                    || row.pendingLoad.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                    return;
+
+                auto result = row.pendingLoad.get();
+                if (row.loadQueued)
+                    startLoad(row);
+                if (result.generation != row.loadGeneration)
+                    return;   // the row was given something else meanwhile
+                if (!result.file)
+                {
+                    row.status = result.error;
                     row.statusIsError = true;
-                    log.add(Severity::Error, "In " + std::to_string(row.index + 1) + ": " + error);
+                    log.add(Severity::Error, "In " + std::to_string(row.index + 1) + ": " + result.error);
                     return;
                 }
 
-                row.file = std::move(file);
+                row.file = std::move(result.file);
+                row.loadedPath = std::move(result.path);
+                row.file->setLevelDb(row.levelDb);
                 row.kind = kFile;
                 row.appliedKind = kFile;
                 engine.setInputSource(row.index, row.file);
@@ -339,18 +477,202 @@ namespace sim
                 log.add(Severity::Ok, "In " + std::to_string(row.index + 1) + " loaded " + row.status);
             }
 
-            void applyIoConfig()
+            void applyIoConfig() { reconfigure(requestedInputs, requestedOutputs); }
+
+            bool reconfigure(int inputs, int outputs)
             {
-                const auto error = engine.reconfigure(requestedInputs, requestedOutputs);
+                const auto error = engine.reconfigure(inputs, outputs);
                 requestedInputs = engine.getNumInputs();
                 requestedOutputs = engine.getNumOutputs();
                 populateRows();
 
                 if (error.empty())
                     log.add(Severity::Ok, "Restarted with " + std::to_string(requestedInputs) + " in / "
-                                          + std::to_string(requestedOutputs) + " out - re-select the device in PluginHost");
+                                          + std::to_string(requestedOutputs) + " out - re-select the device in Tessel");
                 else
                     log.add(Severity::Error, error);
+                return error.empty();
+            }
+
+            /** Adds inputs (never removes any) so `needed` of them exist. */
+            bool growInputs(int needed)
+            {
+                needed = std::min(needed, kMaxChannels);
+                if (needed <= engine.getNumInputs())
+                    return true;
+                return reconfigure(needed, engine.getNumOutputs());
+            }
+
+            // --------------------------------------------------- folder / setups
+
+            /** Gives every input the source `sources` names for it (Off if none): the shared core
+                of loading a folder and recalling a setup. `what` names it in the log. */
+            void applySources(const std::vector<SourceSpec>& sources, const std::string& what)
+            {
+                int needed = 0;
+                for (const auto& spec : sources)
+                    needed = std::max(needed, spec.input + 1);
+                if (!growInputs(needed))
+                    return;
+
+                // Stopped at 0:00, so every stem is in place before Play.
+                engine.setPlaying(false);
+                engine.restart();
+
+                // Rows hidden by an earlier shrink go Off too, or they would come back playing
+                // their old stems when the input count grows again.
+                for (int i = engine.getNumInputs(); i < static_cast<int>(inputRows.size()); ++i)
+                {
+                    auto& row = *inputRows[static_cast<std::size_t>(i)];
+                    cancelLoad(row);
+                    row.kind = row.appliedKind = kSilence;
+                    row.file.reset();
+                    row.loadedPath.clear();
+                    row.status.clear();
+                    engine.setInputSource(i, nullptr);
+                }
+
+                int files = 0;
+                for (int i = 0; i < engine.getNumInputs(); ++i)
+                {
+                    auto& row = *inputRows[static_cast<std::size_t>(i)];
+                    const auto spec = std::find_if(sources.begin(), sources.end(), [i](const auto& s) { return s.input == i; });
+                    const auto kind = spec == sources.end() ? SourceSpec::Kind::Silence : spec->kind;
+
+                    switch (kind)
+                    {
+                        case SourceSpec::Kind::Silence:
+                            cancelLoad(row);
+                            row.kind = kSilence;
+                            break;
+
+                        case SourceSpec::Kind::Sine:
+                            cancelLoad(row);
+                            row.kind = kSine;
+                            row.frequencyHz = spec->frequencyHz;
+                            row.frequencyPosition = row.appliedFrequencyPosition = frequencyToPosition(spec->frequencyHz);
+                            row.levelDb = spec->levelDb;
+                            break;
+
+                        case SourceSpec::Kind::File:
+                            // Silent until the new file is decoded, rather than playing the old one.
+                            row.kind = row.appliedKind = kFile;
+                            row.file.reset();
+                            row.loadedPath.clear();
+                            engine.setInputSource(i, nullptr);
+                            row.path = spec->filePath;
+                            row.levelDb = spec->levelDb;
+                            loadFile(row);
+                            ++files;
+                            break;
+                    }
+                }
+                log.add(Severity::Info, "Loading " + what + ": " + std::to_string(files) + " file"
+                                        + (files == 1 ? "" : "s") + " - transport stopped at 0:00");
+            }
+
+            void loadFolder()
+            {
+                std::string error;
+                const auto files = listAudioFiles(folderPath, error);
+                if (!error.empty())
+                {
+                    log.add(Severity::Error, error);
+                    return;
+                }
+                if (files.empty())
+                {
+                    log.add(Severity::Warn, "No WAV/FLAC/MP3 files in " + folderPath);
+                    return;
+                }
+
+                const auto count = std::min(static_cast<int>(files.size()), kMaxChannels);
+                std::vector<SourceSpec> sources;
+                for (int i = 0; i < count; ++i)
+                {
+                    SourceSpec spec;
+                    spec.input = i;
+                    spec.kind = SourceSpec::Kind::File;
+                    spec.filePath = files[static_cast<std::size_t>(i)].string();
+                    if (i < static_cast<int>(inputRows.size()))   // keep the row's level
+                        spec.levelDb = inputRows[static_cast<std::size_t>(i)]->levelDb;
+                    sources.push_back(std::move(spec));
+                }
+                if (static_cast<int>(files.size()) > count)
+                    log.add(Severity::Warn, "Skipped " + std::to_string(files.size() - count) + " files: the sim has at most "
+                                            + std::to_string(kMaxChannels) + " inputs");
+
+                applySources(sources, "folder " + resolvePath(folderPath).filename().string());
+            }
+
+            void refreshSetups()
+            {
+                setupNames = listSetups(setupsDirectory());
+                selectedSetup = std::clamp(selectedSetup, 0, std::max(0, static_cast<int>(setupNames.size()) - 1));
+            }
+
+            void saveCurrentSetup()
+            {
+                if (!isValidSetupName(saveName))
+                {
+                    log.add(Severity::Error, "Setup names use letters, digits, space, - and _ (up to 64)");
+                    return;
+                }
+
+                InputSetup setup;
+                for (int i = 0; i < engine.getNumInputs(); ++i)
+                {
+                    const auto& row = *inputRows[static_cast<std::size_t>(i)];
+                    SourceSpec spec;
+                    spec.input = i;
+                    spec.levelDb = row.levelDb;
+                    if (row.kind == kSine)
+                    {
+                        spec.kind = SourceSpec::Kind::Sine;
+                        spec.frequencyHz = row.frequencyHz;
+                    }
+                    else if (row.kind == kFile && (row.pendingLoad.valid() || row.loadQueued) && !row.requestedPath.empty())
+                    {
+                        spec.kind = SourceSpec::Kind::File;   // still decoding: save what was asked for
+                        spec.filePath = row.requestedPath;
+                    }
+                    else if (row.kind == kFile && !row.loadedPath.empty())
+                    {
+                        spec.kind = SourceSpec::Kind::File;
+                        spec.filePath = row.loadedPath;
+                    }
+                    else if (row.kind == kFile)
+                        log.add(Severity::Warn, "In " + std::to_string(i + 1) + ": no file loaded, saved as Off");
+                    setup.sources.push_back(std::move(spec));
+                }
+
+                const bool existed = std::find(setupNames.begin(), setupNames.end(), saveName) != setupNames.end();
+                std::string error;
+                if (!saveSetup(setupsDirectory(), saveName, setup, error))
+                {
+                    log.add(Severity::Error, error);
+                    return;
+                }
+                log.add(Severity::Ok, (existed ? "Overwrote setup " : "Saved setup ") + saveName);
+                refreshSetups();
+                if (const auto it = std::find(setupNames.begin(), setupNames.end(), saveName); it != setupNames.end())
+                    selectedSetup = static_cast<int>(it - setupNames.begin());
+                saveName.clear();
+            }
+
+            void recallSetup()
+            {
+                if (selectedSetup < 0 || selectedSetup >= static_cast<int>(setupNames.size()))
+                    return;
+                const auto name = setupNames[static_cast<std::size_t>(selectedSetup)];
+                std::string error;
+                const auto setup = loadSetup(setupsDirectory(), name, error);
+                if (!setup)
+                {
+                    log.add(Severity::Error, error);
+                    return;
+                }
+                applySources(setup->sources, "setup " + name);
             }
 
             // -------------------------------------------------------- transport
@@ -387,12 +709,14 @@ namespace sim
                 const double interval = lastSync ? std::chrono::duration<double>(now - *lastSync).count() : 0.0;
                 lastSync = now;
 
+                engine.housekeeping();
                 engine.setMonitorMuted(monitorMuted);
                 playLabel = engine.isPlaying() ? "■ Stop" : "▶ Play";
 
                 for (int i = 0; i < engine.getNumInputs(); ++i)
                 {
                     auto& row = *inputRows[static_cast<std::size_t>(i)];
+                    finishLoad(row);
                     applyInputRow(row);
                     row.meterDb = row.meter.update(engine.consumeInputPeak(i), interval);
                 }
@@ -415,10 +739,11 @@ namespace sim
                     liveOutputs += live ? 1 : 0;
                 }
 
+                // The poller refreshes the status in the background; this only copies it.
                 if (now - lastStatusPoll > std::chrono::milliseconds(250))
                 {
                     const auto previous = loopback;
-                    loopback = queryLoopbackStatus(engine.getConfig().cardId);
+                    loopback = engine.getLinkStatus();
                     lastStatusPoll = now;
                     logStatusChanges(previous);
                 }
@@ -427,10 +752,10 @@ namespace sim
             /** Adds activity-log entries for whatever changed since the last status poll. */
             void logStatusChanges(const LoopbackStatus& previous)
             {
-                const auto& cardId = engine.getConfig().cardId;
                 if (loopback.cardPresent != previous.cardPresent)
                     log.add(loopback.cardPresent ? Severity::Ok : Severity::Error,
-                            "Loopback card " + cardId + (loopback.cardPresent ? " found" : " missing"));
+                            "Loopback " + deviceText(engine.getConfig()).device
+                                + (loopback.cardPresent ? " found" : " missing"));
 
                 logSubstreamChange("input", previous.appCapture, loopback.appCapture, engine.getNumInputs());
                 logSubstreamChange("output", previous.appPlayback, loopback.appPlayback, engine.getNumOutputs());
@@ -439,6 +764,13 @@ namespace sim
                 if (running != wasRunning)
                     log.add(running ? Severity::Ok : Severity::Error, running ? "Engine running" : "Engine stopped");
                 wasRunning = running;
+
+                const bool stalled = engine.isStalled();
+                if (stalled && !wasStalled)
+                    log.add(Severity::Error, "Loopback stalled: no audio callbacks for over a second");
+                else if (!stalled && wasStalled)
+                    log.add(Severity::Ok, "Loopback running again");
+                wasStalled = stalled;
 
                 const auto loopbackXruns = engine.getLoopbackXruns();
                 if (loopbackXruns > lastLoopbackXruns)
@@ -494,6 +826,8 @@ namespace sim
 
                 if (row.kind != row.appliedKind)
                 {
+                    if (row.appliedKind == kFile)
+                        cancelLoad(row);   // or a decode finishing later switches the row back to File
                     row.appliedKind = row.kind;
                     row.statusIsError = false;
 
@@ -550,12 +884,12 @@ namespace sim
                     text("  "), tag("loopback sim"),
                     filler(),
                     muted("Card "), chip(loopback.cardPresent, "online", "missing"),
-                    muted("   Engine "), chip(running, "running", "stopped"),
+                    muted("   Engine "), engine.isStalled() ? chip(false, "", "stalled") : chip(running, "running", "stopped"),
                     muted("   Local time "), text(EventLog::clockTime()) | color(kText),
                 }));
                 lines.push_back(separatorLight() | color(kPanelBorder));
                 lines.push_back(hbox({
-                    labelValue("Card", config.cardId), text("  "),
+                    labelValue("Card", deviceText(config).device), text("  "),
                     labelValue("Rate", std::to_string(config.sampleRate)), text("  "),
                     labelValue("Period", std::to_string(config.periodFrames)), text("  "),
                     labelValue("Format", running ? engine.getLoopbackFormat() : "-"),
@@ -563,8 +897,7 @@ namespace sim
                 }));
 
                 if (!loopback.cardPresent)
-                    lines.push_back(text("Loopback card not found - run ./setup-loopback.sh (sudo modprobe snd-aloop id="
-                                         + config.cardId + " pcm_substreams=1)") | color(kAmber));
+                    lines.push_back(text(deviceText(config).missingHint) | color(kAmber));
                 if (!lastError.empty())
                     lines.push_back(paragraph(lastError) | color(kRed));
 
@@ -600,6 +933,8 @@ namespace sim
                 std::string details = status.state;
                 if (status.channels > 0)
                     details += " · " + std::to_string(status.channels) + " ch · " + std::to_string(status.rate) + " Hz";
+                else if (status.rate > 0)
+                    details += " · " + std::to_string(status.rate) + " Hz";
                 cells.push_back(muted(details));
                 if (mismatch)
                     cells.push_back(text("  sim has " + std::to_string(expectedChannels) + " ch") | color(kAmber));
@@ -615,10 +950,16 @@ namespace sim
                                       ? chip(engine.isMonitorOpen() && monitorError.empty(), "ok", "unavailable")
                                       : muted("(engine stopped)");
 
+                const auto devices = deviceText(config);
+                const auto selectLine = devices.selectInput == devices.selectOutput
+                    ? hbox({ muted("Select "), text(devices.selectInput) | bold | color(kBright),
+                             muted(" as input and output device") })
+                    : hbox({ muted("Select "), text(devices.selectInput) | bold | color(kBright), muted(" as input, "),
+                             text(devices.selectOutput) | bold | color(kBright), muted(" as output device") });
+
                 return panel("PluginHost link", vbox({
-                    hbox({ muted("Select "), text("StageCue Soundcard Sim") | bold | color(kBright),
-                           muted(" as input and output device") }),
-                    muted("ALSA alias stagecue_sim → " + appPcmName(config)),
+                    selectLine,
+                    muted(devices.detail),
                     substreamRow("Input", loopback.appCapture, engine.getNumInputs()),
                     substreamRow("Output", loopback.appPlayback, engine.getNumOutputs()),
                     hbox({
@@ -681,7 +1022,7 @@ namespace sim
             Element footer()
             {
                 return hbox({
-                    muted(" Tab/arrows: move · ←/→: adjust · Enter: load file · Esc or Ctrl+C: quit"),
+                    muted(" Tab/arrows: move · ←/→: adjust · Enter: load file / folder, save or recall a setup · Esc or Ctrl+C: quit"),
                     filler(),
                     text("▌") | color(kBlue), muted("Ready "),
                 });
@@ -698,12 +1039,17 @@ namespace sim
             int requestedInputs;
             int requestedOutputs;
             bool monitorMuted = false;
+            std::string folderPath;
+            std::string saveName;
+            std::vector<std::string> setupNames;
+            int selectedSetup = 0;
             std::string playLabel = "▶ Play";
             int liveOutputs = 0;
             int meterCells = kMeterCells;
 
             EventLog log;
             bool wasRunning = false;
+            bool wasStalled = false;
             std::uint64_t lastLoopbackXruns = 0;
             std::uint64_t lastMonitorXruns = 0;
             std::string lastEngineError;
@@ -721,12 +1067,15 @@ namespace sim
         SimUi ui(engine, screen);
         auto component = ui.build();
 
+        // At most one redraw tick is ever queued: if a frame takes longer than the
+        // interval, ticks are skipped instead of piling up in FTXUI's event queue.
         std::atomic<bool> ticking { true };
         std::thread ticker([&] {
             while (ticking.load())
             {
                 std::this_thread::sleep_for(kRefreshInterval);
-                screen.PostEvent(Event::Custom);
+                if (!ui.framePending.exchange(true))
+                    screen.PostEvent(Event::Custom);
             }
         });
 

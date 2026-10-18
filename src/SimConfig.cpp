@@ -1,6 +1,8 @@
 #include "SimConfig.h"
 
 #include <charconv>
+#include <cmath>
+#include <locale>
 #include <sstream>
 
 namespace sim
@@ -8,23 +10,35 @@ namespace sim
     namespace
     {
         constexpr const char* kUsage =
-            "StageCueSoundcardSim - ALSA loopback soundcard simulator for StageCue\n"
+            "StageCueSoundcardSim - loopback soundcard simulator for StageCue\n"
             "\n"
             "Usage: StageCueSoundcardSim [options]\n"
             "  --inputs N          simulated inputs (sim -> PluginHost), 1..32   [8]\n"
             "  --outputs N         simulated outputs (PluginHost -> sim), 1..32  [8]\n"
             "  --rate HZ           sample rate                                   [48000]\n"
             "  --period FRAMES     period size; PluginHost's buffer size follows [512]\n"
+#if defined(__APPLE__)
+            "  --inputs-device N   device the inputs are played into [StageCue Soundcard Sim (sim side)]\n"
+            "  --outputs-device N  device the outputs are read from  [StageCue Soundcard Sim (sim side)]\n"
+            "  --host-device N     device PluginHost opens (link status) [StageCue Soundcard Sim]\n"
+            "  --monitor NAME      CoreAudio device for the main out             [default]\n"
+#else
             "  --card ID           snd-aloop card id                             [StageCueSim]\n"
             "  --monitor PCM       ALSA device for the main out                  [default]\n"
+#endif
             "  --source SPEC       preset an input source (repeatable):\n"
             "                        N=silence\n"
             "                        N=sine[:FREQ_HZ[:LEVEL_DB]]\n"
             "                        N=file:PATH[:LEVEL_DB]\n"
             "  --play              start the song transport playing (files in sync)\n"
+            "  --headless          no terminal UI: print a status line every 5 s (soak tests)\n"
             "  -h, --help          show this help\n"
             "\n"
+#if defined(__APPLE__)
+            "Install the loopback devices first: ./setup-loopback.sh\n";
+#else
             "Load the loopback card first: ./setup-loopback.sh\n";
+#endif
 
         template <typename T>
         bool parseNumber(const std::string& text, T& out)
@@ -44,10 +58,52 @@ namespace sim
                 parts.push_back(part);
             return parts;
         }
+
+        /** Shortest text that reads back through parseNumber: "440", "-6", "1234.5". */
+        std::string formatNumber(float value)
+        {
+            const double rounded = std::round(static_cast<double>(value) * 100.0) / 100.0;
+            std::ostringstream stream;
+            stream.imbue(std::locale::classic());
+            stream.setf(std::ios::fixed);
+            stream.precision(2);
+            stream << (rounded == 0.0 ? 0.0 : rounded);   // no "-0"
+            auto text = stream.str();
+            text.erase(text.find_last_not_of('0') + 1);
+            if (text.back() == '.')
+                text.pop_back();
+            return text;
+        }
     }
 
     std::string simPcmName(const SimConfig& config) { return "hw:CARD=" + config.cardId + ",DEV=0"; }
     std::string appPcmName(const SimConfig& config) { return "hw:CARD=" + config.cardId + ",DEV=1"; }
+
+#if defined(__APPLE__)
+    DeviceText deviceText(const SimConfig& config)
+    {
+        return {
+            config.hostDevice,
+            config.hostDevice,
+            config.hostDevice,
+            "CoreAudio loopback (patched BlackHole); the sim uses \"" + config.inputsDevice + "\"",
+            "Loopback device not found - run ./setup-loopback.sh (installs \"" + config.hostDevice
+                + "\" and \"" + config.inputsDevice + "\")",
+        };
+    }
+#else
+    DeviceText deviceText(const SimConfig& config)
+    {
+        return {
+            config.cardId,
+            "StageCue Soundcard Sim",
+            "StageCue Soundcard Sim",
+            "ALSA alias stagecue_sim → " + appPcmName(config),
+            "Loopback card not found - run ./setup-loopback.sh (sudo modprobe snd-aloop id="
+                + config.cardId + " pcm_substreams=1)",
+        };
+    }
+#endif
 
     std::optional<SourceSpec> parseSourceSpec(const std::string& text, std::string& error)
     {
@@ -119,6 +175,22 @@ namespace sim
         return std::nullopt;
     }
 
+    std::string formatSourceSpec(const SourceSpec& spec)
+    {
+        const auto prefix = std::to_string(spec.input + 1) + "=";
+        switch (spec.kind)
+        {
+            case SourceSpec::Kind::Sine:
+                return prefix + "sine:" + formatNumber(spec.frequencyHz) + ":" + formatNumber(spec.levelDb);
+            case SourceSpec::Kind::File:
+                // Always write the level: a path ending in ":<number>" would otherwise read back as one.
+                return prefix + "file:" + spec.filePath + ":" + formatNumber(spec.levelDb);
+            case SourceSpec::Kind::Silence:
+                break;
+        }
+        return prefix + "silence";
+    }
+
     ParseResult parseArgs(int argc, const char* const* argv)
     {
         SimConfig config;
@@ -137,6 +209,12 @@ namespace sim
             if (arg == "--play")
             {
                 config.startPlaying = true;
+                continue;
+            }
+
+            if (arg == "--headless")
+            {
+                config.headless = true;
                 continue;
             }
 
@@ -162,10 +240,25 @@ namespace sim
                 if (!parseNumber(value, config.periodFrames) || config.periodFrames < 16)
                     return fail("invalid --period " + value);
             }
+#if defined(__APPLE__)
+            else if (arg == "--inputs-device")
+            {
+                config.inputsDevice = value;
+            }
+            else if (arg == "--outputs-device")
+            {
+                config.outputsDevice = value;
+            }
+            else if (arg == "--host-device")
+            {
+                config.hostDevice = value;
+            }
+#else
             else if (arg == "--card")
             {
                 config.cardId = value;
             }
+#endif
             else if (arg == "--monitor")
             {
                 config.monitorDevice = value;

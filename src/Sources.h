@@ -2,12 +2,16 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace sim
 {
+    /** Expands a leading "~/" and makes the path absolute (left as is if that fails). */
+    [[nodiscard]] std::filesystem::path resolvePath(const std::string& path);
+
     /** The shared song position for one period. Every input renders the same
         period with the same frame, which keeps file sources sample-aligned. */
     struct TransportFrame
@@ -56,19 +60,24 @@ namespace sim
         std::atomic<float> levelDb;
     };
 
-    /** A mono (mixed-down) audio file, resampled once to the device rate. It has no
+    /** A mono (mixed-down) audio file, decoded once at the device rate. It has no
         playhead of its own: it plays at the transport's song position, and is
         silent while stopped or past its end (until the song loops). */
     class FileSource final : public ISource
     {
     public:
-        /** Decodes WAV/AIFF/FLAC (dr_libs). Returns nullptr and sets `error` on failure. */
-        static std::shared_ptr<FileSource> load(const std::string& path, double targetRate,
-                                                float levelDb, std::string& error);
+        /** Files are held in memory (4 bytes per frame), so their length is capped. */
+        static constexpr double kMaxFileSeconds = 20.0 * 60.0;
 
-        /** Builds a source from already-decoded mono samples (resampling if needed). */
-        static std::shared_ptr<FileSource> fromSamples(std::vector<float> mono, double sourceRate,
-                                                       double targetRate, float levelDb,
+        /** Decodes WAV/FLAC/MP3 (miniaudio), mixed to mono and resampled to targetRate.
+            Returns nullptr and sets `error` on failure. Slow for long files: call it
+            off the UI thread. Setting `cancel` stops the decode (error "cancelled"). */
+        static std::shared_ptr<FileSource> load(const std::string& path, double targetRate,
+                                                float levelDb, std::string& error,
+                                                const std::atomic<bool>* cancel = nullptr);
+
+        /** Builds a source from mono samples already at the device rate. */
+        static std::shared_ptr<FileSource> fromSamples(std::vector<float> mono, float levelDb,
                                                        std::string name = "buffer");
 
         void render(float* out, int numFrames, const TransportFrame& transport) noexcept override;

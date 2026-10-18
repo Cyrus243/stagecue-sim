@@ -4,7 +4,7 @@
 
 namespace sim
 {
-    /** State of one ALSA substream as reported by /proc/asound. */
+    /** State of one direction of the loopback (an ALSA substream on Linux). */
     struct SubstreamStatus
     {
         bool open = false;       // false when "closed" or missing
@@ -14,7 +14,9 @@ namespace sim
         std::string format;
     };
 
-    /** What PluginHost is doing with its end (device 1) of the loopback cable. */
+    /** What PluginHost is doing with its end of the loopback cable. Filled from
+        /proc/asound on Linux and from the CoreAudio HAL's process list on macOS 14+
+        (see platform::LinkProbe). */
     struct LoopbackStatus
     {
         bool cardPresent = false;

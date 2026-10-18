@@ -1,6 +1,6 @@
 #include "Sources.h"
-#include "AudioFileDecoder.h"
 #include "Meters.h"
+#include "MiniaudioConfig.h"
 
 #include <algorithm>
 #include <cmath>
@@ -11,46 +11,20 @@
 
 namespace sim
 {
+    std::filesystem::path resolvePath(const std::string& path)
+    {
+        std::string expanded = path;
+        if (expanded.rfind("~/", 0) == 0)
+            if (const char* home = std::getenv("HOME"))
+                expanded = std::string(home) + expanded.substr(1);
+
+        std::error_code ec;
+        const auto absolute = std::filesystem::absolute(expanded, ec);
+        return ec ? std::filesystem::path(expanded) : absolute;
+    }
+
     namespace
     {
-        std::filesystem::path resolvePath(const std::string& path)
-        {
-            std::string expanded = path;
-            if (expanded.rfind("~/", 0) == 0)
-                if (const char* home = std::getenv("HOME"))
-                    expanded = std::string(home) + expanded.substr(1);
-
-            std::error_code ec;
-            const auto absolute = std::filesystem::absolute(expanded, ec);
-            return ec ? std::filesystem::path(expanded) : absolute;
-        }
-
-        /** Catmull-Rom resampling of a looped signal (indices wrap around). */
-        std::vector<float> resampleLooped(const std::vector<float>& input, double ratio)
-        {
-            const auto inLength = input.size();
-            const auto outLength = std::max<std::size_t>(
-                1, static_cast<std::size_t>(std::floor(static_cast<double>(inLength) / ratio)));
-
-            auto at = [&input, inLength](std::ptrdiff_t index) {
-                const auto n = static_cast<std::ptrdiff_t>(inLength);
-                return input[static_cast<std::size_t>(((index % n) + n) % n)];
-            };
-
-            std::vector<float> output(outLength);
-            for (std::size_t i = 0; i < outLength; ++i)
-            {
-                const double position = static_cast<double>(i) * ratio;
-                const auto base = static_cast<std::ptrdiff_t>(std::floor(position));
-                const auto t = static_cast<float>(position - static_cast<double>(base));
-
-                const float y0 = at(base - 1), y1 = at(base), y2 = at(base + 1), y3 = at(base + 2);
-                output[i] = y1 + 0.5f * t * (y2 - y0 + t * (2.0f * y0 - 5.0f * y1 + 4.0f * y2 - y3
-                                                            + t * (3.0f * (y1 - y2) + y3 - y0)));
-            }
-            return output;
-        }
-
         std::string formatNumber(float value, int precision)
         {
             std::ostringstream stream;
@@ -101,7 +75,8 @@ namespace sim
     }
 
     std::shared_ptr<FileSource> FileSource::load(const std::string& path, double targetRate,
-                                                 float levelDb, std::string& error)
+                                                 float levelDb, std::string& error,
+                                                 const std::atomic<bool>* cancel)
     {
         const auto file = resolvePath(path);
         std::error_code ec;
@@ -111,37 +86,72 @@ namespace sim
             return nullptr;
         }
 
-        std::string decodeError;
-        auto decoded = decodeAudioFile(file.string(), decodeError);
-        if (!decoded)
+        // The decoder mixes down to mono and resamples to the device rate as it reads.
+        const auto rate = static_cast<ma_uint32>(targetRate);
+        const auto decoderConfig = ma_decoder_config_init(ma_format_f32, 1, rate);
+        ma_decoder decoder;
+        if (const auto result = ma_decoder_init_file(file.c_str(), &decoderConfig, &decoder); result != MA_SUCCESS)
         {
-            error = file.filename().string() + ": " + decodeError;
+            error = file.filename().string() + ": cannot decode (" + ma_result_description(result)
+                    + "; WAV, FLAC and MP3 are supported)";
             return nullptr;
         }
 
-        const auto numFrames = decoded->numFrames();
-        const auto numChannels = decoded->channels;
-        const float channelGain = 1.0f / static_cast<float>(numChannels);
+        const auto maxFrames = static_cast<std::uint64_t>(kMaxFileSeconds * targetRate);
+        std::vector<float> mono;
+        if (ma_uint64 length = 0; ma_decoder_get_length_in_pcm_frames(&decoder, &length) == MA_SUCCESS && length > 0)
+            mono.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(length, maxFrames) + 1));
 
-        std::vector<float> mono(numFrames, 0.0f);
-        for (std::size_t i = 0; i < numFrames; ++i)
-            for (unsigned ch = 0; ch < numChannels; ++ch)
-                mono[i] += decoded->interleaved[i * numChannels + ch] * channelGain;
+        constexpr ma_uint64 kChunk = 16384;
+        bool tooLong = false;
+        bool cancelled = false;
+        while (true)
+        {
+            if (cancel && cancel->load(std::memory_order_relaxed))
+            {
+                cancelled = true;
+                break;
+            }
+            const auto offset = mono.size();
+            mono.resize(offset + kChunk);
+            ma_uint64 read = 0;
+            const auto result = ma_decoder_read_pcm_frames(&decoder, mono.data() + offset, kChunk, &read);
+            mono.resize(offset + static_cast<std::size_t>(read));
+            if (mono.size() > maxFrames)
+            {
+                tooLong = true;
+                break;
+            }
+            if (result != MA_SUCCESS || read < kChunk)
+                break;
+        }
+        ma_decoder_uninit(&decoder);
 
-        return fromSamples(std::move(mono), decoded->sampleRate, targetRate, levelDb, file.filename().string());
+        if (cancelled)
+        {
+            error = "cancelled";
+            return nullptr;
+        }
+        if (tooLong)
+        {
+            error = file.filename().string() + ": longer than " + std::to_string(static_cast<int>(kMaxFileSeconds / 60))
+                    + " minutes (files are held in memory, about 11.5 MB per minute)";
+            return nullptr;
+        }
+        if (mono.empty())
+        {
+            error = file.filename().string() + ": no audio";
+            return nullptr;
+        }
+
+        mono.shrink_to_fit();
+        return fromSamples(std::move(mono), levelDb, file.filename().string());
     }
 
-    std::shared_ptr<FileSource> FileSource::fromSamples(std::vector<float> mono, double sourceRate,
-                                                        double targetRate, float levelDb,
-                                                        std::string name)
+    std::shared_ptr<FileSource> FileSource::fromSamples(std::vector<float> mono, float levelDb, std::string name)
     {
         if (mono.empty())
             mono.push_back(0.0f);
-
-        const double ratio = sourceRate / targetRate;
-        if (std::abs(ratio - 1.0) > 1.0e-9)
-            mono = resampleLooped(mono, ratio);
-
         return std::shared_ptr<FileSource>(new FileSource(std::move(mono), levelDb, std::move(name)));
     }
 

@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -98,7 +99,7 @@ TEST(SineSource, IsPhaseContinuousAcrossBlocks)
 TEST(FileSource, PlaysAtTheSongPositionAndWrapsAtTheLoopLength)
 {
     const auto samples = ramp(1000);
-    auto source = FileSource::fromSamples(samples, 48000.0, 48000.0, 0.0f);
+    auto source = FileSource::fromSamples(samples, 0.0f);
     ASSERT_EQ(source->getLengthFrames(), 1000u);
 
     // A block straddling the loop point wraps back to the start.
@@ -112,7 +113,7 @@ TEST(FileSource, PlaysAtTheSongPositionAndWrapsAtTheLoopLength)
 
 TEST(FileSource, IsSilentWhileStoppedButSineKeepsRunning)
 {
-    auto file = FileSource::fromSamples(std::vector<float>(1000, 0.5f), 48000.0, 48000.0, 0.0f);
+    auto file = FileSource::fromSamples(std::vector<float>(1000, 0.5f), 0.0f);
     SineSource sine(48000.0, 1000.0f, -12.0f);
 
     std::vector<float> out(480);
@@ -127,8 +128,8 @@ TEST(FileSource, FilesOfDifferentLengthsStayAlignedToOneSong)
 {
     const auto longSamples = ramp(1000);
     const std::vector<float> shortSamples(longSamples.begin(), longSamples.begin() + 400);
-    auto longFile = FileSource::fromSamples(longSamples, 48000.0, 48000.0, 0.0f);
-    auto shortFile = FileSource::fromSamples(shortSamples, 48000.0, 48000.0, 0.0f);
+    auto longFile = FileSource::fromSamples(longSamples, 0.0f);
+    auto shortFile = FileSource::fromSamples(shortSamples, 0.0f);
 
     // The song loops at the longest file; render it in periods like the engine does.
     constexpr int period = 128;
@@ -150,13 +151,6 @@ TEST(FileSource, FilesOfDifferentLengthsStayAlignedToOneSong)
     }
 }
 
-TEST(FileSource, ResamplesToDeviceRate)
-{
-    std::vector<float> oneSecond(44100, 0.25f);
-    auto source = FileSource::fromSamples(oneSecond, 44100.0, 48000.0, 0.0f);
-    EXPECT_EQ(source->getLengthFrames(), 48000u);
-}
-
 TEST(FileSource, LoadsWavMixesToMonoAndAppliesLevel)
 {
     constexpr std::uint32_t rate = 44100;
@@ -171,11 +165,12 @@ TEST(FileSource, LoadsWavMixesToMonoAndAppliesLevel)
     std::string error;
     auto source = FileSource::load(path.string(), 48000.0, -6.0f, error);
     ASSERT_NE(source, nullptr) << error;
-    EXPECT_EQ(source->getLengthFrames(), 48000u);
+    // Resampled 44.1 -> 48 kHz while decoding (give or take the resampler's latency).
+    EXPECT_NEAR(static_cast<double>(source->getLengthFrames()), 48000.0, 64.0);
     EXPECT_NE(source->describe().find("soundcard-sim-test.wav"), std::string::npos);
 
     std::vector<float> out(4800);
-    source->render(out.data(), static_cast<int>(out.size()), { true, 0, source->getLengthFrames() });
+    source->render(out.data(), static_cast<int>(out.size()), { true, 4800, source->getLengthFrames() });
     EXPECT_NEAR(gainToDb(peakOf(out)), gainToDb(0.5f) - 6.0f, 0.2f);
 
     std::filesystem::remove(path);
@@ -193,4 +188,20 @@ TEST(FileSource, ReportsMissingAndInvalidFiles)
     EXPECT_EQ(FileSource::load(bogus.string(), 48000.0, 0.0f, error), nullptr);
     EXPECT_FALSE(error.empty());
     std::filesystem::remove(bogus);
+}
+
+TEST(FileSource, StopsDecodingWhenCancelled)
+{
+    constexpr std::uint32_t rate = 48000;
+    const auto path = writeWav("soundcard-sim-cancel.wav", { std::vector<float>(rate, 0.25f) }, rate);
+
+    std::atomic<bool> cancelled { true };
+    std::string error;
+    EXPECT_EQ(FileSource::load(path.string(), 48000.0, 0.0f, error, &cancelled), nullptr);
+    EXPECT_EQ(error, "cancelled");
+
+    cancelled = false;
+    error.clear();
+    EXPECT_NE(FileSource::load(path.string(), 48000.0, 0.0f, error, &cancelled), nullptr) << error;
+    std::filesystem::remove(path);
 }
