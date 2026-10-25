@@ -6,7 +6,9 @@ frontend → backend → audio path can be tested without real hardware.
 
 - **Inputs** (sim → PluginHost): each one plays silence, a sine tone
   (frequency and level), or an audio file (WAV/FLAC/MP3, mixed to mono
-  and resampled to the device rate, up to 20 minutes). All files follow one shared transport, so
+  and resampled to the device rate). Files up to 30 s are held in memory; longer ones stream
+  from disk with a few seconds of read-ahead, so a full set of stems stays small enough that
+  the audio callback never waits on swapped-out pages. All files follow one shared transport, so
   they play in sync like a live band (see [Transport](#transport)).
 - **Outputs** (PluginHost → sim): each one has a live meter, a
   **● SIGNAL** indicator (above −60 dBFS, held for 1 s) and "last signal"

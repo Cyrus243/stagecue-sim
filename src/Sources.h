@@ -1,10 +1,14 @@
 #pragma once
 
+#include "StemStream.h"
+
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace sim
@@ -60,37 +64,60 @@ namespace sim
         std::atomic<float> levelDb;
     };
 
-    /** A mono (mixed-down) audio file, decoded once at the device rate. It has no
-        playhead of its own: it plays at the transport's song position, and is
-        silent while stopped or past its end (until the song loops). */
+    /** A mono (mixed-down) audio file at the device rate. It has no playhead of its
+        own: it plays at the transport's song position, and is silent while stopped or
+        past its end (until the song loops). Short files are held in memory; long ones
+        stream from disk through a StemStream (a set of stems decoded whole is gigabytes,
+        and once the OS pages them out the audio callback stalls on page faults). */
     class FileSource final : public ISource
     {
     public:
-        /** Files are held in memory (4 bytes per frame), so their length is capped. */
-        static constexpr double kMaxFileSeconds = 20.0 * 60.0;
+        /** How a file is kept: in memory up to residentMaxFrames, streamed beyond. */
+        struct Storage
+        {
+            std::uint64_t residentMaxFrames = 0;
+            StreamLayout layout;
 
-        /** Decodes WAV/FLAC/MP3 (miniaudio), mixed to mono and resampled to targetRate.
-            Returns nullptr and sets `error` on failure. Slow for long files: call it
-            off the UI thread. Setting `cancel` stops the decode (error "cancelled"). */
+            /** Up to 30 s in memory; longer files stream with StreamLayout::forRate. */
+            [[nodiscard]] static Storage forRate(double sampleRate);
+        };
+
+        /** Opens WAV/FLAC/MP3 (miniaudio), mixed to mono and resampled to targetRate.
+            Returns nullptr and sets `error` on failure. Reads short files whole and the
+            head of long ones, so it can take a while: call it off the UI thread. Setting
+            `cancel` stops it (error "cancelled"). */
         static std::shared_ptr<FileSource> load(const std::string& path, double targetRate,
                                                 float levelDb, std::string& error,
-                                                const std::atomic<bool>* cancel = nullptr);
+                                                const std::atomic<bool>* cancel = nullptr,
+                                                std::optional<Storage> storage = std::nullopt);
 
-        /** Builds a source from mono samples already at the device rate. */
+        /** Builds an in-memory source from mono samples already at the device rate. */
         static std::shared_ptr<FileSource> fromSamples(std::vector<float> mono, float levelDb,
                                                        std::string name = "buffer");
+
+        ~FileSource() override;
+        FileSource(const FileSource&) = delete;
+        FileSource& operator=(const FileSource&) = delete;
 
         void render(float* out, int numFrames, const TransportFrame& transport) noexcept override;
         [[nodiscard]] std::string describe() const override;
 
         void setLevelDb(float db) noexcept { levelDb.store(db); }
         [[nodiscard]] float getLevelDb() const noexcept { return levelDb.load(); }
-        [[nodiscard]] std::size_t getLengthFrames() const noexcept override { return samples.size(); }
+        [[nodiscard]] std::size_t getLengthFrames() const noexcept override;
+
+        [[nodiscard]] bool isStreamed() const noexcept { return stream != nullptr; }
+        /** Frames a streamed file played silent because its read-ahead ran dry. */
+        [[nodiscard]] std::uint64_t getUnderruns() const noexcept { return stream ? stream->getUnderruns() : 0; }
 
     private:
         FileSource(std::vector<float> resampled, float levelDb, std::string name);
+        FileSource(std::unique_ptr<StemStream> stream, float levelDb, std::string name);
 
-        std::vector<float> samples;
+        std::vector<float> samples;          // in memory, or
+        std::unique_ptr<StemStream> stream;  // streamed (fed by `producer`)
+        std::thread producer;
+        std::atomic<bool> stopProducer { false };
         std::atomic<float> levelDb;
         std::string name;
     };

@@ -56,6 +56,7 @@ add_library(soundcard_sim_core STATIC
         src/SimSetup.cpp
         src/Sources.cpp
         src/StatusPoller.cpp
+        src/StemStream.cpp
         src/miniaudio.c
 )
 target_include_directories(soundcard_sim_core PUBLIC src)
@@ -113,6 +114,7 @@ if(SOUNDCARD_SIM_BUILD_TESTS)
             tests/MixerTest.cpp
             tests/SourceSlotsTest.cpp
             tests/SimSetupTest.cpp
+            tests/StemStreamTest.cpp
     )
     target_link_libraries(SoundcardSimTest PRIVATE soundcard_sim_core gtest_main)
     include(GoogleTest)

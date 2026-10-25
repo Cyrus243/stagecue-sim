@@ -5,11 +5,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <numbers>
+#include <thread>
 #include <vector>
 
 using namespace sim;
@@ -204,4 +206,44 @@ TEST(FileSource, StopsDecodingWhenCancelled)
     error.clear();
     EXPECT_NE(FileSource::load(path.string(), 48000.0, 0.0f, error, &cancelled), nullptr) << error;
     std::filesystem::remove(path);
+}
+
+TEST(FileSource, StreamsLongFilesFromDiskInsteadOfHoldingThem)
+{
+    constexpr std::uint32_t rate = 48000;
+    std::vector<float> samples(3 * rate);
+    for (std::size_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<float>(i % 1000) / 2000.0f;
+    const auto path = writeWav("soundcard-sim-stream.wav", { samples }, rate);
+
+    // Anything over 1 s streams: half a second resident, a ring of 6 x 4800 frames.
+    const StreamLayout layout { rate / 2, 4800, 6, 4800 };
+    std::string error;
+    auto source = FileSource::load(path.string(), rate, 0.0f, error, nullptr, FileSource::Storage { rate, layout });
+    ASSERT_NE(source, nullptr) << error;
+    EXPECT_TRUE(source->isStreamed());
+    EXPECT_EQ(source->getLengthFrames(), samples.size());
+
+    // Play it through twice in 10 ms periods at about 10x real time.
+    constexpr int period = 480;
+    const auto length = source->getLengthFrames();
+    std::vector<float> out(period);
+    for (std::uint64_t position = 0; position < 2 * length; position += period)
+    {
+        source->render(out.data(), period, { true, position % length, length });
+        for (int i = 0; i < period; ++i)
+        {
+            const auto frame = (position + static_cast<std::uint64_t>(i)) % length;
+            ASSERT_NEAR(out[i], samples[frame], 1.0f / 32767.0f) << "frame " << position + i;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(source->getUnderruns(), 0u);
+    std::filesystem::remove(path);
+}
+
+TEST(FileSource, KeepsShortFilesInMemory)
+{
+    auto source = FileSource::fromSamples(std::vector<float>(1000, 0.5f), 0.0f);
+    EXPECT_FALSE(source->isStreamed());
 }
